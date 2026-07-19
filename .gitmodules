@@ -1,0 +1,3 @@
+[submodule "gammachirp"]
+	path = gammachirp
+	url = https://github.com/transkatgirl/gammachirp
