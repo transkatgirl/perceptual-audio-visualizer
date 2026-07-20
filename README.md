@@ -7,8 +7,11 @@ An [egui](https://github.com/emilk/egui) front-end for
   (wav/flac/mp3/ogg/m4a). The file is decoded, downmixed to mono, and streamed
   through a dynamic compressive gammachirp filterbank one sample at a time
   (default range 40 Hz – 16 kHz, 100 ERB-spaced channels, dynamic control).
-  The resulting dcGC output is written straight to disk as a `.gca` file, so
-  inputs larger than RAM are fine.
+  Every `GcParam` item is customizable in collapsible sections: gammachirp
+  filter coefficients, gain/level references, level estimation, outer/middle-ear
+  correction, and hearing-loss characteristics. The resulting dcGC output is
+  written straight to disk as a `.gca` file, so inputs larger than RAM are
+  fine.
 - **Analysis viewer** — plots a saved `.gca` as a scrolling
   spectrogram (time × auditory channel, dB color scale) in sync with playback
   of the source audio. Supports play/pause (Space), seeking (←/→, Shift for

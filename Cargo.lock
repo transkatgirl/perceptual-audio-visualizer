@@ -2586,6 +2586,7 @@ dependencies = [
  "eframe",
  "gammachirp-rs",
  "memmap2",
+ "ndarray",
  "rfd",
  "rodio",
 ]

@@ -93,20 +93,32 @@ pub fn streaming_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, Analys
     Decoder::try_from(BufReader::new(file)).map_err(message)
 }
 
-/// Parameters for one builder run.
+/// Parameters for one builder run: a complete [`GcParam`] template.
+///
+/// Every user-facing GcParam item is customizable. The exceptions are managed
+/// by the builder itself: `fs` is forced to the input file's sample rate and
+/// `dyn_hpaf.str_prc` is forced to `"sample-base"` (that is what makes this a
+/// per-sample analysis), while `hloss`, `fr1`, and the derived `lvl_est`
+/// fields are computed by the library's `set_param`.
 #[derive(Clone, Debug)]
 pub struct BuilderParams {
-    pub num_channels: usize,
-    pub f_range: [f64; 2],
-    pub control: ControlMode,
+    pub gc: GcParam,
 }
 
 impl Default for BuilderParams {
     fn default() -> Self {
         Self {
-            num_channels: 100,
-            f_range: [40.0, 16_000.0],
-            control: ControlMode::Dynamic,
+            gc: GcParam {
+                num_ch: 100,
+                f_range: [40.0, 16_000.0],
+                out_mid_crct: "ELC".into(),
+                ctrl: ControlMode::Dynamic,
+                dyn_hpaf: DynHpaf {
+                    str_prc: "sample-base".into(),
+                    ..DynHpaf::default()
+                },
+                ..GcParam::default()
+            },
         }
     }
 }
@@ -247,49 +259,45 @@ fn run_analysis_inner(
 ) -> Result<AnalysisHeader, AnalysisError> {
     let probe = probe_audio(input)?;
     let fs = probe.sample_rate as f64;
-    if params.num_channels < 2 {
+    if params.gc.num_ch < 2 {
         return Err(AnalysisError::Message(
             "channel count must be at least 2".into(),
         ));
     }
-    if !(params.f_range[0] > 0.0 && params.f_range[0] < params.f_range[1]) {
+    if !(params.gc.f_range[0] > 0.0 && params.gc.f_range[0] < params.gc.f_range[1]) {
         return Err(AnalysisError::Message(format!(
             "invalid frequency range [{:.0}, {:.0}] Hz",
-            params.f_range[0], params.f_range[1]
+            params.gc.f_range[0], params.gc.f_range[1]
         )));
     }
-    if params.f_range[1] >= fs / 2.0 {
+    if params.gc.f_range[1] >= fs / 2.0 {
         return Err(AnalysisError::Message(format!(
             "max frequency {:.0} Hz must be below the Nyquist limit {:.0} Hz \
              (file sample rate {:.0} Hz)",
-            params.f_range[1],
+            params.gc.f_range[1],
             fs / 2.0,
             fs
         )));
     }
 
-    let mut stream = GcfbStream::new(GcParam {
+    let gc_param = GcParam {
         fs,
-        num_ch: params.num_channels,
-        f_range: params.f_range,
-        out_mid_crct: "No".into(),
-        ctrl: params.control,
+        // Sample-base control is what makes this a per-sample analysis;
+        // frame-base emits delayed frame-rate events instead.
         dyn_hpaf: DynHpaf {
-            // Sample-base control is what makes this a per-sample analysis;
-            // frame-base emits delayed frame-rate events instead.
             str_prc: "sample-base".into(),
-            ..DynHpaf::default()
+            ..params.gc.dyn_hpaf.clone()
         },
-        ..GcParam::default()
-    })
-    .map_err(message)?;
+        ..params.gc.clone()
+    };
+    let mut stream = GcfbStream::new(gc_param).map_err(message)?;
 
     let header = AnalysisHeader {
         sample_rate: fs,
-        num_channels: params.num_channels as u32,
+        num_channels: params.gc.num_ch as u32,
         num_samples: 0, // patched at the end
-        f_range: params.f_range,
-        control_mode: control_mode_tag(params.control),
+        f_range: params.gc.f_range,
+        control_mode: control_mode_tag(params.gc.ctrl),
         channel_freqs: stream.gc_resp().fr1.to_vec(),
     };
 
@@ -300,7 +308,7 @@ fn run_analysis_inner(
     let decoder = streaming_decoder(input)?;
     let channels = probe.channels.max(1) as usize;
     let chunk_len = (probe.sample_rate as usize / 4).max(1); // ~0.25 s of mono audio
-    let num_ch = params.num_channels;
+    let num_ch = params.gc.num_ch;
 
     let mut mono_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
     let mut mix_acc = 0.0_f64;
@@ -562,9 +570,11 @@ mod tests {
         let expected_samples = write_test_wav(&wav);
 
         let params = BuilderParams {
-            num_channels: 32,
-            f_range: [40.0, 16_000.0],
-            control: ControlMode::Dynamic,
+            gc: GcParam {
+                num_ch: 32,
+                f_range: [40.0, 16_000.0],
+                ..BuilderParams::default().gc
+            },
         };
         let cancel = AtomicBool::new(false);
         let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
@@ -617,13 +627,52 @@ mod tests {
         let (wav, gca) = temp_paths("nyquist");
         write_test_wav(&wav);
         let params = BuilderParams {
-            f_range: [40.0, 23_000.0], // 44.1 kHz file → Nyquist 22.05 kHz
-            ..BuilderParams::default()
+            gc: GcParam {
+                f_range: [40.0, 23_000.0], // 44.1 kHz file → Nyquist 22.05 kHz
+                ..BuilderParams::default().gc
+            },
         };
         let cancel = AtomicBool::new(false);
         let result = run_analysis(&wav, &gca, &params, |_| {}, &cancel);
         assert!(matches!(result, Err(AnalysisError::Message(_))));
         assert!(!gca.exists());
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Customized `GcParam` items must flow through the builder unchanged
+    /// (except `fs` and `dyn_hpaf.str_prc`, which the builder forces).
+    #[test]
+    fn end_to_end_customized_gc_param() {
+        use gammachirp_rs::gcfb_v234::GainReference;
+
+        let (wav, gca) = temp_paths("custom");
+        let expected_samples = write_test_wav(&wav);
+
+        let params = BuilderParams {
+            gc: GcParam {
+                num_ch: 16,
+                out_mid_crct: "ELC".into(),
+                n: 3.5,
+                b1: [1.5, 0.1],
+                ctrl: ControlMode::Static,
+                level_db_scgcfb: 40.0,
+                gain_ref: GainReference::Db(50.0),
+                num_update_asym_cmp: 4,
+                hloss_type: "HL3".into(),
+                hloss_compression_health: Some(0.7),
+                ..BuilderParams::default().gc
+            },
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, expected_samples);
+        assert_eq!(header.num_channels, 16);
+        assert_eq!(header.control_mode, control_mode_tag(ControlMode::Static));
+        assert_eq!(header.channel_freqs.len(), 16);
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert_eq!(reader.header, header);
+        assert_eq!(reader.data().len(), expected_samples as usize * 16);
         let _ = fs::remove_dir_all(wav.parent().unwrap());
     }
 }

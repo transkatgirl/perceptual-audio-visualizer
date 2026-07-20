@@ -10,7 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
-use gammachirp_rs::gcfb_v234::ControlMode;
+use gammachirp_rs::gcfb_v234::{ControlMode, GainReference, GcParam};
+use ndarray::Array1;
 
 use crate::analysis::{
     AnalysisError, AnalysisHeader, AudioProbe, BuilderParams, probe_audio, run_analysis,
@@ -21,6 +22,18 @@ const CONTROL_MODES: [(&str, ControlMode); 3] = [
     ("Static", ControlMode::Static),
     ("Level", ControlMode::Level),
 ];
+
+/// Valid `out_mid_crct` values (see `mk_filter_field2cochlea` in gammachirp-rs).
+const OUT_MID_CRCT_OPTIONS: [&str; 6] =
+    ["No", "ELC", "FreeField", "DiffuseField", "ITU", "EarDrum"];
+
+/// Valid `hloss_type` values (see `hearing_pattern` in gammachirp-rs).
+const HLOSS_TYPES: [&str; 10] = [
+    "NH", "HL0", "HL1", "HL2", "HL3", "HL4", "HL5", "HL6", "HL7", "HL8",
+];
+
+/// Audiogram frequencies for the manual (HL0) hearing-level editor.
+const AUDIOGRAM_FREQS: [f64; 7] = [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0];
 
 enum BuilderMsg {
     Progress(u64),
@@ -34,51 +47,22 @@ struct RunningState {
     rx: Receiver<BuilderMsg>,
 }
 
+#[derive(Default)]
 pub struct BuilderTab {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     probe: Option<AudioProbe>,
-    f_low: f64,
-    f_high: f64,
-    num_channels: u32,
-    control_idx: usize,
+    params: BuilderParams,
     running: Option<RunningState>,
     done_samples: u64,
     status: String,
     status_is_error: bool,
 }
 
-impl Default for BuilderTab {
-    fn default() -> Self {
-        let defaults = BuilderParams::default();
-        Self {
-            input: None,
-            output: None,
-            probe: None,
-            f_low: defaults.f_range[0],
-            f_high: defaults.f_range[1],
-            num_channels: defaults.num_channels as u32,
-            control_idx: 0,
-            running: None,
-            done_samples: 0,
-            status: String::new(),
-            status_is_error: false,
-        }
-    }
-}
-
 impl BuilderTab {
     fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
         self.status = text.into();
         self.status_is_error = is_error;
-    }
-
-    fn params(&self) -> BuilderParams {
-        BuilderParams {
-            num_channels: self.num_channels as usize,
-            f_range: [self.f_low, self.f_high],
-            control: CONTROL_MODES[self.control_idx].1,
-        }
     }
 
     fn validation_error(&self) -> Option<String> {
@@ -88,16 +72,17 @@ impl BuilderTab {
         if self.output.is_none() {
             return Some("choose an output file".into());
         }
-        if !(self.f_low > 0.0 && self.f_low < self.f_high) {
+        let f_range = self.params.gc.f_range;
+        if !(f_range[0] > 0.0 && f_range[0] < f_range[1]) {
             return Some("frequency range must satisfy 0 < low < high".into());
         }
         if let Some(probe) = &self.probe {
             let nyquist = probe.sample_rate as f64 / 2.0;
-            if self.f_high >= nyquist {
+            if f_range[1] >= nyquist {
                 return Some(format!(
                     "max frequency {:.0} Hz must be below Nyquist {nyquist:.0} Hz \
                      for this {:.0} Hz file",
-                    self.f_high, probe.sample_rate
+                    f_range[1], probe.sample_rate
                 ));
             }
         }
@@ -108,14 +93,14 @@ impl BuilderTab {
         let probe = self.probe.as_ref()?;
         let duration = probe.total_duration?;
         let samples = duration.as_secs_f64() * f64::from(probe.sample_rate);
-        Some(samples as u64 * u64::from(self.num_channels) * 4)
+        Some(samples as u64 * self.params.gc.num_ch as u64 * 4)
     }
 
     fn start(&mut self) {
         let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else {
             return;
         };
-        let params = self.params();
+        let params = self.params.clone();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
@@ -169,6 +154,216 @@ impl BuilderTab {
         }
     }
 
+    /// Controls for every customizable `GcParam` item, grouped into collapsible
+    /// sections. Fields the builder manages (`fs`, `dyn_hpaf.str_prc`) or the
+    /// library computes (`hloss`, `fr1`, derived `lvl_est` values) are
+    /// intentionally not shown.
+    fn params_ui(&mut self, ui: &mut egui::Ui) {
+        let gc = &mut self.params.gc;
+
+        egui::CollapsingHeader::new("Filterbank")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Frequency range (Hz)");
+                    ui.add(
+                        egui::DragValue::new(&mut gc.f_range[0])
+                            .range(1.0..=96_000.0)
+                            .speed(1.0),
+                    );
+                    ui.label("to");
+                    ui.add(
+                        egui::DragValue::new(&mut gc.f_range[1])
+                            .range(1.0..=96_000.0)
+                            .speed(10.0),
+                    );
+                    ui.label("Channels");
+                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=512));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Control");
+                    egui::ComboBox::from_id_salt("control_mode")
+                        .selected_text(control_mode_name(gc.ctrl))
+                        .show_ui(ui, |ui| {
+                            for (label, mode) in CONTROL_MODES {
+                                ui.selectable_value(&mut gc.ctrl, mode, label);
+                            }
+                        });
+                    ui.label("Outer/middle-ear correction");
+                    egui::ComboBox::from_id_salt("out_mid_crct")
+                        .selected_text(gc.out_mid_crct.as_str())
+                        .show_ui(ui, |ui| {
+                            for option in OUT_MID_CRCT_OPTIONS {
+                                ui.selectable_value(
+                                    &mut gc.out_mid_crct,
+                                    option.to_owned(),
+                                    option,
+                                );
+                            }
+                        });
+                });
+                ui.label(
+                    "Dynamic is the full level-dependent dcGC (slowest, several × realtime). \
+                     Static and Level are cheaper.",
+                );
+            });
+
+        egui::CollapsingHeader::new("Gammachirp coefficients")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    "Each pair is [value at 1 kHz, ERB slope]: per channel it becomes \
+                     value + slope × (ERB(f) / ERB(1 kHz) − 1).",
+                );
+                egui::Grid::new("gammachirp_coef_grid")
+                    .num_columns(3)
+                    .show(ui, |ui| {
+                        ui.label("n (filter order)");
+                        ui.add(egui::DragValue::new(&mut gc.n).speed(0.01));
+                        ui.end_row();
+                        coef_pair_row(ui, "b1", &mut gc.b1);
+                        coef_pair_row(ui, "c1", &mut gc.c1);
+                        coef_pair_row(ui, "frat0", &mut gc.frat[0]);
+                        coef_pair_row(ui, "frat1", &mut gc.frat[1]);
+                        coef_pair_row(ui, "b2", &mut gc.b2[0]);
+                        coef_pair_row(ui, "c2", &mut gc.c2[0]);
+                        coef_pair_row(ui, "b2[1] (unused)", &mut gc.b2[1]);
+                        coef_pair_row(ui, "c2[1] (unused)", &mut gc.c2[1]);
+                    });
+                ui.label("The second rows of b2 and c2 are validated but unused by GCFB v2.34.");
+            });
+
+        egui::CollapsingHeader::new("Gain & levels")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("gain_level_grid")
+                    .num_columns(4)
+                    .show(ui, |ui| {
+                        ui.label("Gain compensation (dB)");
+                        ui.add(egui::DragValue::new(&mut gc.gain_cmpnst_db).speed(0.1));
+                        ui.label("Gain reference");
+                        gain_ref_editor(ui, gc);
+                        ui.end_row();
+
+                        ui.label("Static-mode level (dB)");
+                        ui.add(egui::DragValue::new(&mut gc.level_db_scgcfb).speed(1.0))
+                            .on_hover_text(
+                                "Presentation level at which the passive gammachirp \
+                                 response is fixed in Static control mode",
+                            );
+                        ui.label("Asym. comp. update interval (samples)");
+                        ui.add(egui::DragValue::new(&mut gc.num_update_asym_cmp).range(1..=65_536));
+                        ui.end_row();
+
+                        ui.label("Meddis HC RMS 0 dB ↔ SPL (dB)");
+                        ui.add(
+                            egui::DragValue::new(&mut gc.meddis_hc_level_rms0db_spldb).speed(0.1),
+                        );
+                        ui.end_row();
+                    });
+            });
+
+        egui::CollapsingHeader::new("Level estimation")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label("Level estimate feeding the Dynamic and Level control modes.");
+                let lvl = &mut gc.lvl_est;
+                egui::Grid::new("lvl_est_grid")
+                    .num_columns(4)
+                    .show(ui, |ui| {
+                        ui.label("Location (ERB)");
+                        ui.add(egui::DragValue::new(&mut lvl.lct_erb).speed(0.05));
+                        ui.label("Half-life decay");
+                        ui.add(
+                            egui::DragValue::new(&mut lvl.decay_hl)
+                                .range(0.000_1..=120.0)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+
+                        ui.label("b2");
+                        ui.add(egui::DragValue::new(&mut lvl.b2).speed(0.01));
+                        ui.label("c2");
+                        ui.add(egui::DragValue::new(&mut lvl.c2).speed(0.01));
+                        ui.end_row();
+
+                        ui.label("frat");
+                        ui.add(egui::DragValue::new(&mut lvl.frat).speed(0.01));
+                        ui.label("Weight");
+                        ui.add(egui::DragValue::new(&mut lvl.weight).speed(0.01));
+                        ui.end_row();
+
+                        ui.label("RMS→SPL (dB)");
+                        ui.add(egui::DragValue::new(&mut lvl.rms2spldb).speed(0.1));
+                        ui.label("Reference level (dB)");
+                        ui.add(egui::DragValue::new(&mut lvl.ref_db).speed(1.0));
+                        ui.end_row();
+
+                        ui.label("pwr[0]");
+                        ui.add(egui::DragValue::new(&mut lvl.pwr[0]).speed(0.01));
+                        ui.label("pwr[1]");
+                        ui.add(egui::DragValue::new(&mut lvl.pwr[1]).speed(0.01));
+                        ui.end_row();
+                    });
+            });
+
+        egui::CollapsingHeader::new("Hearing loss")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Hearing-loss type");
+                    egui::ComboBox::from_id_salt("hloss_type")
+                        .selected_text(gc.hloss_type.as_str())
+                        .show_ui(ui, |ui| {
+                            for kind in HLOSS_TYPES {
+                                ui.selectable_value(&mut gc.hloss_type, kind.to_owned(), kind);
+                            }
+                        });
+                });
+                if gc.hloss_type == "HL0" {
+                    let audiogram = gc
+                        .hloss_hearing_level_db
+                        .get_or_insert_with(|| Array1::zeros(7));
+                    ui.label("Manual audiogram (dB HL):");
+                    egui::Grid::new("audiogram_grid")
+                        .num_columns(7)
+                        .show(ui, |ui| {
+                            for freq in AUDIOGRAM_FREQS {
+                                ui.label(format!("{freq:.0} Hz"));
+                            }
+                            ui.end_row();
+                            for value in audiogram.iter_mut() {
+                                ui.add(egui::DragValue::new(value).range(0.0..=120.0).speed(0.5));
+                            }
+                            ui.end_row();
+                        });
+                } else {
+                    gc.hloss_hearing_level_db = None;
+                }
+                ui.horizontal(|ui| {
+                    let mut override_health = gc.hloss_compression_health.is_some();
+                    if ui
+                        .checkbox(&mut override_health, "Override compression health")
+                        .changed()
+                    {
+                        gc.hloss_compression_health = override_health.then_some(1.0);
+                    }
+                    if let Some(health) = &mut gc.hloss_compression_health {
+                        ui.add(egui::DragValue::new(health).range(0.0..=1.0).speed(0.01))
+                            .on_hover_text(
+                                "0 = fully impaired, 1 = healthy; defaults to 1 for NH \
+                                 and 0.5 for HL types",
+                            );
+                    }
+                });
+            });
+
+        ui.add_space(4.0);
+        if ui.button("Reset parameters to defaults").clicked() {
+            self.params = BuilderParams::default();
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.poll();
         let running = self.running.is_some();
@@ -190,7 +385,9 @@ impl BuilderTab {
             file_row(ui, "Audio input", &mut self.input, false);
             if ui
                 .button("Probe / re-read file info")
-                .on_hover_text("Reads sample rate, channel count, and duration without decoding everything")
+                .on_hover_text(
+                    "Reads sample rate, channel count, and duration without decoding everything",
+                )
                 .clicked()
                 && let Some(path) = &self.input
             {
@@ -234,35 +431,7 @@ impl BuilderTab {
             }
 
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Frequency range (Hz)");
-                ui.add(
-                    egui::DragValue::new(&mut self.f_low)
-                        .range(1.0..=96_000.0)
-                        .speed(1.0),
-                );
-                ui.label("to");
-                ui.add(
-                    egui::DragValue::new(&mut self.f_high)
-                        .range(1.0..=96_000.0)
-                        .speed(10.0),
-                );
-                ui.label("Channels");
-                ui.add(egui::DragValue::new(&mut self.num_channels).range(2..=512));
-                ui.label("Control");
-                egui::ComboBox::from_id_salt("control_mode")
-                    .selected_text(CONTROL_MODES[self.control_idx].0)
-                    .show_ui(ui, |ui| {
-                        for (idx, (label, _)) in CONTROL_MODES.iter().enumerate() {
-                            ui.selectable_value(&mut self.control_idx, idx, *label);
-                        }
-                    });
-            });
-            ui.label(
-                "Dynamic is the full level-dependent dcGC (slowest, several × realtime). \
-                 Static and Level are cheaper. Outer/middle-ear correction is off; \
-                 hearing-loss characteristics are normal hearing.",
-            );
+            self.params_ui(ui);
         });
 
         ui.add_space(8.0);
@@ -270,13 +439,13 @@ impl BuilderTab {
             ui.label(format!(
                 "Estimated output size: {} ({} ch × 4 B × per-sample)",
                 human_bytes(bytes),
-                self.num_channels
+                self.params.gc.num_ch
             ));
         } else if let Some(probe) = &self.probe {
             ui.label(format!(
                 "Output size: ~{}/s of audio at {} channels",
-                human_bytes(u64::from(probe.sample_rate) * u64::from(self.num_channels) * 4),
-                self.num_channels
+                human_bytes(u64::from(probe.sample_rate) * self.params.gc.num_ch as u64 * 4),
+                self.params.gc.num_ch
             ));
         }
 
@@ -309,10 +478,10 @@ impl BuilderTab {
                     .map(|d| (d.as_secs_f64() * f64::from(p.sample_rate)) as u64)
             });
             let bar = match total {
-                Some(total) if total > 0 => egui::ProgressBar::new(
-                    (self.done_samples as f32 / total as f32).min(1.0),
-                )
-                .show_percentage(),
+                Some(total) if total > 0 => {
+                    egui::ProgressBar::new((self.done_samples as f32 / total as f32).min(1.0))
+                        .show_percentage()
+                }
                 _ => egui::ProgressBar::new(0.0)
                     .animate(true)
                     .text(format!("{} samples", self.done_samples)),
@@ -331,6 +500,47 @@ impl BuilderTab {
     }
 }
 
+fn control_mode_name(mode: ControlMode) -> &'static str {
+    CONTROL_MODES
+        .iter()
+        .find(|(_, candidate)| *candidate == mode)
+        .map(|(label, _)| *label)
+        .unwrap_or("Unknown")
+}
+
+/// One labelled grid row editing a two-element coefficient pair.
+fn coef_pair_row(ui: &mut egui::Ui, label: &str, pair: &mut [f64; 2]) {
+    ui.label(label);
+    ui.add(egui::DragValue::new(&mut pair[0]).speed(0.001));
+    ui.add(egui::DragValue::new(&mut pair[1]).speed(0.001));
+    ui.end_row();
+}
+
+/// Combo box for the gain-reference mode plus a dB editor when a fixed level
+/// is selected. `GainReference::Db` is a reference presentation level; 50 dB
+/// matches the library's static-mode default.
+fn gain_ref_editor(ui: &mut egui::Ui, gc: &mut GcParam) {
+    let mut fixed_db = matches!(gc.gain_ref, GainReference::Db(_));
+    egui::ComboBox::from_id_salt("gain_ref")
+        .selected_text(if fixed_db {
+            "Fixed level (dB)"
+        } else {
+            "Normalize IO function"
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut fixed_db, false, "Normalize IO function");
+            ui.selectable_value(&mut fixed_db, true, "Fixed level (dB)");
+        });
+    gc.gain_ref = match (fixed_db, gc.gain_ref) {
+        (true, GainReference::Db(db)) => GainReference::Db(db),
+        (true, GainReference::NormalizeIoFunction) => GainReference::Db(50.0),
+        (false, _) => GainReference::NormalizeIoFunction,
+    };
+    if let GainReference::Db(ref mut db) = gc.gain_ref {
+        ui.add(egui::DragValue::new(db).speed(1.0).suffix(" dB"));
+    }
+}
+
 fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, save: bool) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -344,10 +554,14 @@ fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, save: bo
             if save {
                 dialog = dialog.add_filter("gammachirp analysis", &["gca"]);
             } else {
-                dialog = dialog
-                    .add_filter("audio", &["wav", "flac", "mp3", "ogg", "m4a", "mp4", "aac"]);
+                dialog =
+                    dialog.add_filter("audio", &["wav", "flac", "mp3", "ogg", "m4a", "mp4", "aac"]);
             }
-            let picked = if save { dialog.save_file() } else { dialog.pick_file() };
+            let picked = if save {
+                dialog.save_file()
+            } else {
+                dialog.pick_file()
+            };
             if let Some(picked) = picked {
                 *path = Some(picked);
             }
