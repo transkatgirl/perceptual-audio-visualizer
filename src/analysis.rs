@@ -174,8 +174,8 @@ impl Default for BinauralParams {
         Self {
             tau_max_seconds: 5e-3,
             num_tau: 9,
-            iid_max_db: 10.0,
-            num_iid: 5,
+            iid_max_db: 5.0,
+            num_iid: 19,
             peripheral: PeripheralConfig::default(),
             ei: EiConfig::streaming(),
         }
@@ -295,7 +295,8 @@ pub struct AnalysisHeader {
 
 impl AnalysisHeader {
     pub fn header_len(&self) -> usize {
-        FIXED_HEADER_LEN + 8 * (self.channel_freqs.len() + self.tau_seconds.len() + self.iid_db.len())
+        FIXED_HEADER_LEN
+            + 8 * (self.channel_freqs.len() + self.tau_seconds.len() + self.iid_db.len())
     }
 
     pub fn duration(&self) -> f64 {
@@ -307,7 +308,11 @@ impl AnalysisHeader {
     /// and activity).
     pub fn values_per_sample(&self) -> usize {
         let num_ch = self.num_channels as usize;
-        if self.mode == MODE_BINAURAL { 4 * num_ch } else { num_ch }
+        if self.mode == MODE_BINAURAL {
+            4 * num_ch
+        } else {
+            num_ch
+        }
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -334,8 +339,8 @@ impl AnalysisHeader {
             bytes[start..start + 8].copy_from_slice(&tau.to_le_bytes());
         }
         for (index, iid) in self.iid_db.iter().enumerate() {
-            let start = FIXED_HEADER_LEN
-                + 8 * (self.channel_freqs.len() + self.tau_seconds.len() + index);
+            let start =
+                FIXED_HEADER_LEN + 8 * (self.channel_freqs.len() + self.tau_seconds.len() + index);
             bytes[start..start + 8].copy_from_slice(&iid.to_le_bytes());
         }
         bytes
