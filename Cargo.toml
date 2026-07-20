@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 gammachirp-rs = { path = "gammachirp" }
+eframe   = "0.35"
+rodio    = "0.22"
+memmap2  = "0.9"
+rfd      = "0.17"
+bytemuck = "1"
