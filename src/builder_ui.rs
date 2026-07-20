@@ -105,8 +105,11 @@ impl BuilderTab {
             if !(bin.tau_max_seconds.is_finite() && bin.tau_max_seconds > 0.0) {
                 return Some("ITD range must be positive".into());
             }
-            if bin.num_tau == 0 {
-                return Some("EI population must have at least one unit".into());
+            if bin.num_tau == 0 || bin.num_iid == 0 {
+                return Some("EI population must have at least one unit per dimension".into());
+            }
+            if !(bin.iid_max_db.is_finite() && bin.iid_max_db > 0.0) {
+                return Some("IID range must be positive".into());
             }
             if let Some(probe) = &self.probe {
                 if probe.channels != 2 {
@@ -132,13 +135,14 @@ impl BuilderTab {
         Some(samples as u64 * self.values_per_sample() as u64 * 4)
     }
 
-    /// f32 values written per input sample: the GCFB channels in mono, both
-    /// ears plus the EI population (unit-major) in binaural mode.
+    /// f32 values written per input sample: the GCFB channels in mono, the
+    /// two-ear dcGC mean plus the lowest-EI-unit IID, ITD, and activity in
+    /// binaural mode.
     fn values_per_sample(&self) -> usize {
         let num_ch = self.params.gc.num_ch;
         match self.params.mode {
             AnalysisMode::Mono => num_ch,
-            AnalysisMode::Binaural => (2 + self.params.binaural.num_tau) * num_ch,
+            AnalysisMode::Binaural => 4 * num_ch,
         }
     }
 
@@ -427,7 +431,7 @@ impl BuilderTab {
                         if ui
                             .add(
                                 egui::DragValue::new(&mut tau_ms)
-                                    .range(0.05..=5.0)
+                                    .range(0.05..=10.0)
                                     .speed(0.05),
                             )
                             .changed()
@@ -437,10 +441,20 @@ impl BuilderTab {
                         ui.label("ITD units");
                         ui.add(egui::DragValue::new(&mut bin.num_tau).range(1..=41));
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("IID range ± (dB)");
+                        ui.add(
+                            egui::DragValue::new(&mut bin.iid_max_db)
+                                .range(1.0..=40.0)
+                                .speed(0.5),
+                        );
+                        ui.label("IID units");
+                        ui.add(egui::DragValue::new(&mut bin.num_iid).range(1..=21));
+                    });
                     ui.label(
-                        "Units are spaced linearly over ±the ITD range with zero \
-                         characteristic IID; level differences are rendered from the \
-                         per-ear outputs.",
+                        "Units form a linear ITD × IID grid; per channel and sample only \
+                         the lowest-activity unit's characteristic IID, ITD, and activity \
+                         are stored, so the population size does not affect file size.",
                     );
                 });
 

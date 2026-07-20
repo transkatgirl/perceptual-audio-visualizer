@@ -193,9 +193,16 @@ impl ViewerTab {
                 .map(|tau| tau.abs())
                 .fold(0.0_f64, f64::max)
                 * 1000.0;
+            let iid_max_db = header
+                .iid_db
+                .iter()
+                .map(|iid| iid.abs())
+                .fold(0.0_f64, f64::max);
             info = format!(
-                "{info} · {} EI units, ±{tau_max_ms:.1} ms",
-                header.tau_seconds.len()
+                "{info} · {} EI units ({} ITD × {} IID), ±{tau_max_ms:.1} ms, ±{iid_max_db:.0} dB",
+                header.tau_seconds.len() * header.iid_db.len(),
+                header.tau_seconds.len(),
+                header.iid_db.len(),
             );
         }
         ui.label(info);
@@ -444,36 +451,18 @@ impl ViewerTab {
             let ch = ch.min(num_ch - 1);
             let sample = (time * fs).clamp(0.0, (loaded.reader.header.num_samples - 1) as f64);
             if loaded.reader.is_binaural() {
-                let left = loaded.reader.left_row(sample as u64)[ch].abs();
-                let right = loaded.reader.right_row(sample as u64)[ch].abs();
-                let db = 20.0 * ((left + right) / 2.0 + 1e-12).log10();
-                let stereo = match loaded.spec.stereo_var {
-                    StereoVar::Iid => format!(
-                        "{:+.1} dB IID",
-                        20.0 * ((left + 1e-12) / (right + 1e-12)).log10()
-                    ),
-                    StereoVar::Itd => {
-                        // Same trough-picking as the renderer (see render_column).
-                        let ei = loaded.reader.ei_row(sample as u64);
-                        let mut unit = 0;
-                        let mut min = f32::INFINITY;
-                        for u in 0..loaded.reader.header.tau_seconds.len() {
-                            let value = ei[u * num_ch + ch];
-                            if value < min {
-                                min = value;
-                                unit = u;
-                            }
-                        }
-                        format!("{:.2} ms ITD", loaded.reader.header.tau_seconds[unit] * 1e3)
-                    }
-                };
+                let sample = sample as u64;
+                let amp = loaded.reader.dcgc_row(sample)[ch].abs();
+                let db = 20.0 * (amp + 1e-12).log10();
+                let iid_db = loaded.reader.iid_row(sample)[ch];
+                let itd_ms = loaded.reader.itd_row(sample)[ch] * 1e3;
+                let ei_mu = loaded.reader.ei_row(sample)[ch];
                 response.clone().on_hover_text(format!(
-                    "{} · {:.0} Hz (ch {}) · {:.1} dB · {}",
+                    "{} · {:.0} Hz (ch {}) · {:.1} dB · {iid_db:+.1} dB IID · {itd_ms:.2} ms ITD · {ei_mu:.3} MU EI",
                     fmt_time(time),
                     loaded.reader.header.channel_freqs[ch],
                     ch,
                     db,
-                    stereo
                 ));
             } else {
                 let value = loaded.reader.row(sample as u64)[ch];
@@ -524,14 +513,6 @@ impl ViewerTab {
                             .selectable_value(&mut loaded.spec.stereo_var, StereoVar::Itd, "ITD")
                             .changed();
                     });
-                if loaded.spec.stereo_var == StereoVar::Iid {
-                    stereo_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut loaded.spec.iid_range_db, 1.0..=40.0)
-                                .text("IID range ±dB"),
-                        )
-                        .changed();
-                }
                 if stereo_changed {
                     loaded.spec.invalidate();
                 }
@@ -652,15 +633,14 @@ struct Spectrogram {
     dirty: bool,
     peaks: Vec<f32>,
     lut: Vec<egui::Color32>,
-    /// Binaural rendering state; `peaks_r`, `ei_sums`, and `lut2d` stay empty
-    /// for mono analyses, and `peaks` doubles as the left-ear peaks buffer.
+    /// Binaural rendering state; `iid_sums`, `itd_sums`, and `lut2d` stay
+    /// empty for mono analyses, and `peaks` doubles as the dcGC peaks buffer.
     binaural: bool,
-    num_tau: usize,
     tau_max: f32,
+    iid_max: f32,
     stereo_var: StereoVar,
-    iid_range_db: f32,
-    peaks_r: Vec<f32>,
-    ei_sums: Vec<f32>,
+    iid_sums: Vec<f32>,
+    itd_sums: Vec<f32>,
     lut2d: Vec<egui::Color32>,
 }
 
@@ -668,10 +648,10 @@ struct Spectrogram {
 /// the downmixed amplitude always drives lightness.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum StereoVar {
-    /// Interaural intensity difference from the per-ear peaks.
+    /// Characteristic IID of the lowest-activity EI unit.
     #[default]
     Iid,
-    /// Interaural time difference from the EI population trough.
+    /// Characteristic ITD of the lowest-activity EI unit.
     Itd,
 }
 
@@ -682,12 +662,18 @@ impl Spectrogram {
             egui::ColorImage::new([TEX_W, num_ch], vec![egui::Color32::BLACK; TEX_W * num_ch]);
         let texture = ctx.load_texture("spectrogram", image.clone(), egui::TextureOptions::NEAREST);
         let binaural = reader.is_binaural();
-        let num_tau = reader.header.tau_seconds.len();
         let tau_max = reader
             .header
             .tau_seconds
             .iter()
             .map(|tau| tau.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1e-12) as f32;
+        let iid_max = reader
+            .header
+            .iid_db
+            .iter()
+            .map(|iid| iid.abs())
             .fold(0.0_f64, f64::max)
             .max(1e-12) as f32;
         Self {
@@ -701,16 +687,11 @@ impl Spectrogram {
             peaks: vec![0.0; num_ch],
             lut: magma_lut(),
             binaural,
-            num_tau,
             tau_max,
+            iid_max,
             stereo_var: StereoVar::default(),
-            iid_range_db: 20.0,
-            peaks_r: if binaural { vec![0.0; num_ch] } else { Vec::new() },
-            ei_sums: if binaural {
-                vec![0.0; num_tau * num_ch]
-            } else {
-                Vec::new()
-            },
+            iid_sums: if binaural { vec![0.0; num_ch] } else { Vec::new() },
+            itd_sums: if binaural { vec![0.0; num_ch] } else { Vec::new() },
             lut2d: if binaural {
                 crate::colormap::bivariate_lut()
             } else {
@@ -781,32 +762,22 @@ impl Spectrogram {
                 a,
                 b,
                 &mut self.peaks,
-                &mut self.peaks_r,
-                &mut self.ei_sums,
+                &mut self.iid_sums,
+                &mut self.itd_sums,
             );
+            let count = (b - a) as f32;
             for ch in 0..self.num_ch {
-                let amp = (self.peaks[ch] + self.peaks_r[ch]) / 2.0;
-                let db = 20.0 * (amp + 1e-12).log10();
+                let db = 20.0 * (self.peaks[ch] + 1e-12).log10();
                 let t = ((db - floor_db) / span).clamp(0.0, 1.0);
+                // The stored values are the characteristic IID/ITD of each
+                // sample's lowest-activity EI unit; use the column mean.
                 let s = match self.stereo_var {
                     StereoVar::Iid => {
-                        let iid_db = 20.0
-                            * ((self.peaks[ch] + 1e-12) / (self.peaks_r[ch] + 1e-12)).log10();
-                        (iid_db / self.iid_range_db + 1.0) / 2.0
+                        let iid_db = self.iid_sums[ch] / count;
+                        (iid_db / self.iid_max + 1.0) / 2.0
                     }
                     StereoVar::Itd => {
-                        // The EI stage integrates (L − R)², so the unit tuned to
-                        // the stimulus ITD cancels it: the ITD is the trough.
-                        let mut unit = 0;
-                        let mut min = f32::INFINITY;
-                        for u in 0..self.num_tau {
-                            let sum = self.ei_sums[u * self.num_ch + ch];
-                            if sum < min {
-                                min = sum;
-                                unit = u;
-                            }
-                        }
-                        let tau = reader.header.tau_seconds[unit] as f32;
+                        let tau = self.itd_sums[ch] / count;
                         (tau / self.tau_max + 1.0) / 2.0
                     }
                 };
@@ -840,16 +811,16 @@ fn auto_ceiling(reader: &AnalysisReader, view_start: f64, view_span: f64) -> f32
     let num_ch = reader.header.num_channels as usize;
     let mut peaks = vec![0.0_f32; num_ch];
     if reader.is_binaural() {
-        // Ceiling from the per-ear peaks downmixed to mono.
-        let mut peaks_r = vec![0.0_f32; num_ch];
-        let mut ei_sums = vec![0.0_f32; reader.header.tau_seconds.len() * num_ch];
+        // Ceiling from the peaks of the stored two-ear dcGC mean.
+        let mut iid_sums = vec![0.0_f32; num_ch];
+        let mut itd_sums = vec![0.0_f32; num_ch];
         for i in 0..64_u64 {
             let p = p0 + i * (TEX_W as u64 / 64);
             let a = (p as f64 * spp) as u64;
             let b = (((p + 1) as f64 * spp) as u64).max(a + 1);
-            reader.aggregate_binaural_column(a, b, &mut peaks, &mut peaks_r, &mut ei_sums);
-            for ch in 0..num_ch {
-                max = max.max((peaks[ch] + peaks_r[ch]) / 2.0);
+            reader.aggregate_binaural_column(a, b, &mut peaks, &mut iid_sums, &mut itd_sums);
+            for &v in &peaks {
+                max = max.max(v);
             }
         }
     } else {

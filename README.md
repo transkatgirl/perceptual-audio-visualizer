@@ -12,7 +12,7 @@ An [egui](https://github.com/emilk/egui) front-end for
     gammachirp/Breebaart hybrid: one GCFB per ear, inner-hair-cell lowpass and
     adaptation loops, and an excitation-inhibition (EI) population tuned to a
     configurable range of characteristic ITDs (default 9 units over ±1 ms).
-    The per-ear dcGC outputs and the EI activity are all stored.
+    The mean of the per-ear dcGC outputs and the EI activity are stored.
 
   Every `GcParam` item is customizable in collapsible sections: gammachirp
   filter coefficients, gain/level references, level estimation, outer/middle-ear
@@ -51,21 +51,25 @@ the sibling `.gca` is picked up automatically — press *Load*, and hit *Play*.
 The max frequency must be below half the audio file's sample rate, so the
 default 16 kHz ceiling requires a ≥ 32.1 kHz file. Binaural mode requires a
 stereo file. Dynamic control is several × slower than realtime; Static and
-Level are cheaper. Binaural files are `(2 + num_tau)` × larger than mono
-ones (11× at the default 9 EI units).
+Level are cheaper. Binaural files are 4× larger than mono ones, regardless of
+the EI population size.
 
 ## `.gca` format
 
 Little-endian, self-describing header (magic `GCA1`, version 1, sample rate,
 channel count, sample count, frequency range, control mode, analysis mode,
 per-channel center frequencies in Hz, and — for binaural analyses — the EI
-population's characteristic ITDs in seconds), followed by the analysis as
-sample-major `f32` rows:
+population's ITD grid in seconds and IID grid in dB), followed by the
+analysis as sample-major `f32` rows:
 
 - **mono**: `num_samples × num_channels` dcGC values;
-- **binaural**: per sample `[left dcGC | right dcGC | EI activity]`, i.e.
-  `num_samples × (2 + num_tau) × num_channels` values with the EI activity
-  stored unit-major.
+- **binaural**: per sample `[mean dcGC | IID | ITD | EI activity]`,
+  i.e. `num_samples × 4 × num_channels` values. The first block holds the
+  mean of the two ears' dcGC amplitudes; the last three blocks hold, per
+  channel, the characteristic IID (dB), characteristic ITD (seconds), and
+  activity of the lowest-activity EI unit of the ITD × IID population — the
+  unit that best cancels the stimulus, as in the `breebaart2001_hybrid`
+  example of the gammachirp crate.
 
 A time window is therefore one contiguous byte range in either mode, which is
 what makes cheap memory-mapped viewing possible.
