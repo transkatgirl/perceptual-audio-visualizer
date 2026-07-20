@@ -35,11 +35,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytemuck::cast_slice;
-use gammachirp_rs::breebaart2001::{
-    EiConfig, EiIntegrationBoundary, EiStreamSample, EiUnit, HybridBinauralConfig,
-    HybridBinauralStream, HybridBinauralStreamStep, PeripheralConfig,
-};
 use gammachirp_rs::gcfb_v234::{ControlMode, DcgcEvent, DynHpaf, GcParam, GcfbStream};
+use gammachirp_rs::{
+    breebaart2001::{
+        EiConfig, EiIntegrationBoundary, EiStreamSample, EiUnit, HybridBinauralConfig,
+        HybridBinauralStream, HybridBinauralStreamStep, PeripheralConfig,
+    },
+    gcfb_v234::gcfb_v234::LvlEst,
+};
 use memmap2::Mmap;
 use rodio::{Decoder, Source};
 
@@ -161,16 +164,7 @@ impl Default for BinauralParams {
         Self {
             tau_max_seconds: 1e-3,
             num_tau: 9,
-            peripheral: PeripheralConfig {
-                // The library default calibrates dcGC amplitude 1 to the
-                // GCFB's internal 30 dB SPL reference, which floors typical
-                // digital audio (dcGC output ≈ −44 dB re. waveform amplitude)
-                // below the adaptation minimum level. Calibrating amplitude 1
-                // to 100 dB SPL places full-scale digital audio near 50 dB
-                // SPL with the default filterbank settings.
-                amplitude_one_db_spl: Some(100.0),
-                ..PeripheralConfig::default()
-            },
+            peripheral: PeripheralConfig::default(),
             ei: EiConfig::streaming(),
         }
     }
@@ -220,6 +214,10 @@ impl Default for BuilderParams {
                 dyn_hpaf: DynHpaf {
                     str_prc: "sample-base".into(),
                     ..DynHpaf::default()
+                },
+                lvl_est: LvlEst {
+                    rms2spldb: 100.0,
+                    ..Default::default()
                 },
                 ..GcParam::default()
             },

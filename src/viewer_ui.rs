@@ -497,8 +497,10 @@ impl ViewerTab {
             let ceil_changed = ui
                 .add(egui::Slider::new(ceil_db, -120.0..=20.0).text("ceiling"))
                 .changed();
-            if ui.button("Auto ceiling").clicked() {
+            if ui.button("Auto range").clicked() {
                 *ceil_db = auto_ceiling(&loaded.reader, *view_start, *view_span);
+                *floor_db = (*ceil_db - 40.0).max(-140.0);
+                loaded.spec.invalidate();
             }
             if floor_changed || ceil_changed {
                 if *floor_db >= *ceil_db {
