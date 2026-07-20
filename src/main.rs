@@ -4,6 +4,7 @@
 
 mod analysis;
 mod builder_ui;
+mod colormap;
 mod viewer_ui;
 
 use eframe::egui;

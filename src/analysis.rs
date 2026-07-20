@@ -1,6 +1,6 @@
-//! Offline per-sample GCFB v2.34 analysis: binary file format, builder core,
-//! and a memory-mapped reader. This module contains no GUI code so it can be
-//! unit-tested headlessly.
+//! Offline per-sample analysis: mono GCFB v2.34 or binaural Breebaart-2001 /
+//! GCFB hybrid, with a binary file format, builder core, and a memory-mapped
+//! reader. This module contains no GUI code so it can be unit-tested headlessly.
 //!
 //! File format (`.gca`, little-endian):
 //!
@@ -14,13 +14,18 @@
 //! 32  f64  f_range_low
 //! 40  f64  f_range_high
 //! 48  u32  control_mode (0=Static, 1=Dynamic, 2=Level)
-//! 52  u32  header_len = 64 + 8*num_channels
-//! 56  ..64 reserved (zeros)
+//! 52  u32  header_len = 64 + 8*num_channels + 8*num_tau
+//! 56  u32  mode (0 = mono, 1 = binaural)
+//! 60  u32  num_tau (EI population size; 0 for mono)
 //! 64  f64 × num_channels   channel center frequencies (gc_resp.fr1)
-//! header_len..  f32 × num_samples × num_channels, SAMPLE-MAJOR
-//!               (sample n, channel c at header_len + (n*num_ch + c)*4)
+//! ..  f64 × num_tau        EI unit characteristic ITDs in seconds (binaural)
+//! header_len..  sample-major f32 data:
+//!               mono:     per sample [dcgc num_ch]
+//!               binaural: per sample [dcgc_left num_ch][dcgc_right num_ch]
+//!                         [ei num_tau × num_ch]  (EI activity, unit-major)
 //! ```
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
@@ -30,6 +35,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytemuck::cast_slice;
+use gammachirp_rs::breebaart2001::{
+    EiConfig, EiIntegrationBoundary, EiStreamSample, EiUnit, HybridBinauralConfig,
+    HybridBinauralStream, HybridBinauralStreamStep, PeripheralConfig,
+};
 use gammachirp_rs::gcfb_v234::{ControlMode, DcgcEvent, DynHpaf, GcParam, GcfbStream};
 use memmap2::Mmap;
 use rodio::{Decoder, Source};
@@ -39,6 +48,10 @@ const VERSION: u32 = 1;
 const ENGINE_GCFB_V234_SAMPLE: u32 = 1;
 const FIXED_HEADER_LEN: usize = 64;
 const NUM_SAMPLES_OFFSET: u64 = 24;
+
+/// Numeric analysis-mode tags stored in the file header.
+pub const MODE_MONO: u32 = 0;
+pub const MODE_BINAURAL: u32 = 1;
 
 /// Errors returned by [`probe_audio`] and [`run_analysis`].
 #[derive(Debug)]
@@ -93,7 +106,95 @@ pub fn streaming_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, Analys
     Decoder::try_from(BufReader::new(file)).map_err(message)
 }
 
-/// Parameters for one builder run: a complete [`GcParam`] template.
+/// Analysis kind selected by the builder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnalysisMode {
+    /// Downmix all input channels to mono and run a single GCFB.
+    #[default]
+    Mono,
+    /// Breebaart-2001 / GCFB hybrid of a stereo input: per-ear GCFB plus an
+    /// excitation-inhibition population tuned to interaural time differences.
+    Binaural,
+}
+
+impl AnalysisMode {
+    /// Numeric tag stored in the file header.
+    pub fn tag(self) -> u32 {
+        match self {
+            AnalysisMode::Mono => MODE_MONO,
+            AnalysisMode::Binaural => MODE_BINAURAL,
+        }
+    }
+}
+
+/// Human-readable label for a stored analysis-mode tag.
+pub fn mode_label(tag: u32) -> &'static str {
+    match tag {
+        MODE_MONO => "Mono",
+        MODE_BINAURAL => "Binaural",
+        _ => "Unknown",
+    }
+}
+
+/// Binaural-specific parameters: the EI population shape plus the peripheral
+/// and EI stages of the Breebaart hybrid.
+///
+/// The population is one-dimensional over characteristic ITD with zero
+/// characteristic IID: interaural level information is rendered from the
+/// per-ear gammachirp outputs directly. `ei.integration_boundary` is forced
+/// to causal zero-state and `ei.max_abs_delay_seconds` to `tau_max_seconds`
+/// by the builder; every other item is user-facing.
+#[derive(Clone, Debug)]
+pub struct BinauralParams {
+    /// Largest characteristic ITD of the EI population, in seconds.
+    pub tau_max_seconds: f64,
+    /// Number of EI units, spaced linearly over ±`tau_max_seconds`.
+    pub num_tau: usize,
+    /// Inner-hair-cell, level-calibration, and adaptation-loop settings.
+    pub peripheral: PeripheralConfig,
+    /// EI population settings, including post-EI internal noise.
+    pub ei: EiConfig,
+}
+
+impl Default for BinauralParams {
+    fn default() -> Self {
+        Self {
+            tau_max_seconds: 1e-3,
+            num_tau: 9,
+            peripheral: PeripheralConfig {
+                // The library default calibrates dcGC amplitude 1 to the
+                // GCFB's internal 30 dB SPL reference, which floors typical
+                // digital audio (dcGC output ≈ −44 dB re. waveform amplitude)
+                // below the adaptation minimum level. Calibrating amplitude 1
+                // to 100 dB SPL places full-scale digital audio near 50 dB
+                // SPL with the default filterbank settings.
+                amplitude_one_db_spl: Some(100.0),
+                ..PeripheralConfig::default()
+            },
+            ei: EiConfig::streaming(),
+        }
+    }
+}
+
+impl BinauralParams {
+    /// The EI population: `num_tau` units linearly spaced over
+    /// ±`tau_max_seconds`, all with zero characteristic IID.
+    pub fn units(&self) -> Vec<EiUnit> {
+        let n = self.num_tau.max(1);
+        if n == 1 {
+            return vec![EiUnit::new(0.0, 0.0)];
+        }
+        (0..n)
+            .map(|index| {
+                let frac = index as f64 / (n - 1) as f64;
+                EiUnit::new(self.tau_max_seconds * (2.0 * frac - 1.0), 0.0)
+            })
+            .collect()
+    }
+}
+
+/// Parameters for one builder run: a complete [`GcParam`] template plus the
+/// analysis mode and its binaural settings.
 ///
 /// Every user-facing GcParam item is customizable. The exceptions are managed
 /// by the builder itself: `fs` is forced to the input file's sample rate and
@@ -103,6 +204,9 @@ pub fn streaming_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, Analys
 #[derive(Clone, Debug)]
 pub struct BuilderParams {
     pub gc: GcParam,
+    pub mode: AnalysisMode,
+    /// Used only when `mode` is [`AnalysisMode::Binaural`].
+    pub binaural: BinauralParams,
 }
 
 impl Default for BuilderParams {
@@ -119,6 +223,8 @@ impl Default for BuilderParams {
                 },
                 ..GcParam::default()
             },
+            mode: AnalysisMode::Mono,
+            binaural: BinauralParams::default(),
         }
     }
 }
@@ -151,17 +257,32 @@ pub struct AnalysisHeader {
     pub f_range: [f64; 2],
     /// See [`control_mode_tag`].
     pub control_mode: u32,
+    /// See [`MODE_MONO`] / [`MODE_BINAURAL`].
+    pub mode: u32,
+    /// Characteristic ITDs of the EI population in seconds (empty for mono).
+    pub tau_seconds: Vec<f64>,
     /// Channel center frequencies in Hz (`num_channels` entries).
     pub channel_freqs: Vec<f64>,
 }
 
 impl AnalysisHeader {
     pub fn header_len(&self) -> usize {
-        FIXED_HEADER_LEN + 8 * self.channel_freqs.len()
+        FIXED_HEADER_LEN + 8 * (self.channel_freqs.len() + self.tau_seconds.len())
     }
 
     pub fn duration(&self) -> f64 {
         self.num_samples as f64 / self.sample_rate
+    }
+
+    /// f32 values stored per sample: `num_ch` for mono,
+    /// `(2 + num_tau) * num_ch` for binaural.
+    pub fn values_per_sample(&self) -> usize {
+        let num_ch = self.num_channels as usize;
+        if self.mode == MODE_BINAURAL {
+            (2 + self.tau_seconds.len()) * num_ch
+        } else {
+            num_ch
+        }
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -176,9 +297,15 @@ impl AnalysisHeader {
         bytes[40..48].copy_from_slice(&self.f_range[1].to_le_bytes());
         bytes[48..52].copy_from_slice(&self.control_mode.to_le_bytes());
         bytes[52..56].copy_from_slice(&(self.header_len() as u32).to_le_bytes());
+        bytes[56..60].copy_from_slice(&self.mode.to_le_bytes());
+        bytes[60..64].copy_from_slice(&(self.tau_seconds.len() as u32).to_le_bytes());
         for (index, freq) in self.channel_freqs.iter().enumerate() {
             let start = FIXED_HEADER_LEN + 8 * index;
             bytes[start..start + 8].copy_from_slice(&freq.to_le_bytes());
+        }
+        for (index, tau) in self.tau_seconds.iter().enumerate() {
+            let start = FIXED_HEADER_LEN + 8 * (self.channel_freqs.len() + index);
+            bytes[start..start + 8].copy_from_slice(&tau.to_le_bytes());
         }
         bytes
     }
@@ -199,15 +326,25 @@ impl AnalysisHeader {
             |offset: usize| f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         let version = read_u32(4);
         if version != VERSION {
-            return Err(invalid(&format!("unsupported version {version}")));
+            return Err(invalid(&format!(
+                "unsupported version {version} (rebuild the analysis)"
+            )));
         }
         let engine = read_u32(8);
         if engine != ENGINE_GCFB_V234_SAMPLE {
             return Err(invalid(&format!("unsupported engine {engine}")));
         }
+        let mode = read_u32(56);
+        if mode != MODE_MONO && mode != MODE_BINAURAL {
+            return Err(invalid(&format!("unknown analysis mode {mode}")));
+        }
         let num_channels = read_u32(20);
+        let num_tau = read_u32(60);
+        if num_channels == 0 || (mode == MODE_MONO) != (num_tau == 0) {
+            return Err(invalid("inconsistent mode / channel / EI unit counts"));
+        }
         let header_len = read_u32(52) as usize;
-        if num_channels == 0 || header_len != FIXED_HEADER_LEN + 8 * num_channels as usize {
+        if header_len != FIXED_HEADER_LEN + 8 * (num_channels + num_tau) as usize {
             return Err(invalid("inconsistent channel count / header length"));
         }
         if bytes.len() < header_len {
@@ -217,19 +354,68 @@ impl AnalysisHeader {
         for index in 0..num_channels as usize {
             channel_freqs.push(read_f64(FIXED_HEADER_LEN + 8 * index));
         }
+        let mut tau_seconds = Vec::with_capacity(num_tau as usize);
+        for index in 0..num_tau as usize {
+            tau_seconds.push(read_f64(
+                FIXED_HEADER_LEN + 8 * (num_channels as usize + index),
+            ));
+        }
         Ok(Self {
             sample_rate: read_f64(12),
             num_channels,
             num_samples: read_u64(24),
             f_range: [read_f64(32), read_f64(40)],
             control_mode: read_u32(48),
+            mode,
+            tau_seconds,
             channel_freqs,
         })
     }
 }
 
-/// Run an offline per-sample GCFB v2.34 analysis of `input` and stream the
-/// result to `output`.
+/// Validate the filterbank settings shared by both analysis modes.
+fn validate_gc(gc: &GcParam, fs: f64) -> Result<(), AnalysisError> {
+    if gc.num_ch < 2 {
+        return Err(AnalysisError::Message(
+            "channel count must be at least 2".into(),
+        ));
+    }
+    if !(gc.f_range[0] > 0.0 && gc.f_range[0] < gc.f_range[1]) {
+        return Err(AnalysisError::Message(format!(
+            "invalid frequency range [{:.0}, {:.0}] Hz",
+            gc.f_range[0], gc.f_range[1]
+        )));
+    }
+    if gc.f_range[1] >= fs / 2.0 {
+        return Err(AnalysisError::Message(format!(
+            "max frequency {:.0} Hz must be below the Nyquist limit {:.0} Hz \
+             (file sample rate {:.0} Hz)",
+            gc.f_range[1],
+            fs / 2.0,
+            fs
+        )));
+    }
+    Ok(())
+}
+
+/// The prepared filterbank template with the builder-forced fields applied.
+fn prepared_gc(gc: &GcParam, fs: f64) -> GcParam {
+    GcParam {
+        fs,
+        // Sample-base control is what makes this a per-sample analysis;
+        // frame-base emits delayed frame-rate events instead.
+        dyn_hpaf: DynHpaf {
+            str_prc: "sample-base".into(),
+            ..gc.dyn_hpaf.clone()
+        },
+        ..gc.clone()
+    }
+}
+
+/// Run an offline per-sample analysis of `input` and stream the result to
+/// `output`. In mono mode the input is downmixed and run through a single
+/// GCFB v2.34; in binaural mode a stereo input runs through the
+/// Breebaart-2001 / GCFB hybrid (per-ear GCFB plus an EI population).
 ///
 /// Decoding, filtering, and writing are all chunked, so peak memory is
 /// independent of the input length. `progress` is called with the number of
@@ -242,7 +428,10 @@ pub fn run_analysis(
     mut progress: impl FnMut(u64),
     cancel: &AtomicBool,
 ) -> Result<AnalysisHeader, AnalysisError> {
-    let result = run_analysis_inner(input, output, params, &mut progress, cancel);
+    let result = match params.mode {
+        AnalysisMode::Mono => run_mono_inner(input, output, params, &mut progress, cancel),
+        AnalysisMode::Binaural => run_binaural_inner(input, output, params, &mut progress, cancel),
+    };
     if result.is_err() {
         // Never leave a partial or corrupt file behind.
         let _ = fs::remove_file(output);
@@ -250,7 +439,7 @@ pub fn run_analysis(
     result
 }
 
-fn run_analysis_inner(
+fn run_mono_inner(
     input: &Path,
     output: &Path,
     params: &BuilderParams,
@@ -259,38 +448,9 @@ fn run_analysis_inner(
 ) -> Result<AnalysisHeader, AnalysisError> {
     let probe = probe_audio(input)?;
     let fs = probe.sample_rate as f64;
-    if params.gc.num_ch < 2 {
-        return Err(AnalysisError::Message(
-            "channel count must be at least 2".into(),
-        ));
-    }
-    if !(params.gc.f_range[0] > 0.0 && params.gc.f_range[0] < params.gc.f_range[1]) {
-        return Err(AnalysisError::Message(format!(
-            "invalid frequency range [{:.0}, {:.0}] Hz",
-            params.gc.f_range[0], params.gc.f_range[1]
-        )));
-    }
-    if params.gc.f_range[1] >= fs / 2.0 {
-        return Err(AnalysisError::Message(format!(
-            "max frequency {:.0} Hz must be below the Nyquist limit {:.0} Hz \
-             (file sample rate {:.0} Hz)",
-            params.gc.f_range[1],
-            fs / 2.0,
-            fs
-        )));
-    }
+    validate_gc(&params.gc, fs)?;
 
-    let gc_param = GcParam {
-        fs,
-        // Sample-base control is what makes this a per-sample analysis;
-        // frame-base emits delayed frame-rate events instead.
-        dyn_hpaf: DynHpaf {
-            str_prc: "sample-base".into(),
-            ..params.gc.dyn_hpaf.clone()
-        },
-        ..params.gc.clone()
-    };
-    let mut stream = GcfbStream::new(gc_param).map_err(message)?;
+    let mut stream = GcfbStream::new(prepared_gc(&params.gc, fs)).map_err(message)?;
 
     let header = AnalysisHeader {
         sample_rate: fs,
@@ -298,6 +458,8 @@ fn run_analysis_inner(
         num_samples: 0, // patched at the end
         f_range: params.gc.f_range,
         control_mode: control_mode_tag(params.gc.ctrl),
+        mode: params.mode.tag(),
+        tau_seconds: Vec::new(),
         channel_freqs: stream.gc_resp().fr1.to_vec(),
     };
 
@@ -356,12 +518,7 @@ fn run_analysis_inner(
     // Sample-base modes emit no tail events, but the contract requires this.
     stream.finish().map_err(message)?;
 
-    writer.flush()?;
-    writer.seek(SeekFrom::Start(NUM_SAMPLES_OFFSET))?;
-    writer.write_all(&num_samples.to_le_bytes())?;
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-
+    finalize(writer, num_samples)?;
     progress(num_samples);
     Ok(AnalysisHeader {
         num_samples,
@@ -401,6 +558,219 @@ fn process_chunk(
     Ok(())
 }
 
+/// Binaural output assembly: per-ear dcGC rows are buffered for the short EI
+/// latency, then interleaved with the matching EI activity as
+/// `[left | right | ei]` rows. EI events arrive in sample order, exactly one
+/// per input sample, so the queue head always matches the next event.
+struct BinauralState {
+    pending: VecDeque<(Vec<f32>, Vec<f32>)>,
+    write_buf: Vec<f32>,
+    num_samples: u64,
+}
+
+impl BinauralState {
+    fn new(chunk_len: usize, num_ch: usize, num_tau: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            write_buf: Vec::with_capacity(chunk_len * (2 + num_tau) * num_ch),
+            num_samples: 0,
+        }
+    }
+
+    fn push_step(&mut self, step: HybridBinauralStreamStep) -> Result<(), AnalysisError> {
+        let dcgc_left = dcgc_f32(&step.left_filterbank.event, &step.left_filterbank.scgc_smpl);
+        let dcgc_right = dcgc_f32(
+            &step.right_filterbank.event,
+            &step.right_filterbank.scgc_smpl,
+        );
+        self.pending.push_back((dcgc_left, dcgc_right));
+        if let Some(event) = step.ei_event {
+            self.emit(event)?;
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, event: EiStreamSample) -> Result<(), AnalysisError> {
+        let (left, right) = self.pending.pop_front().ok_or_else(|| {
+            AnalysisError::Message("EI event without a matching filterbank sample".into())
+        })?;
+        debug_assert_eq!(event.sample_index as u64, self.num_samples);
+        self.write_buf.extend_from_slice(&left);
+        self.write_buf.extend_from_slice(&right);
+        self.write_buf
+            .extend(event.activity.iter().map(|&v| v as f32));
+        self.num_samples += 1;
+        Ok(())
+    }
+}
+
+fn dcgc_f32(event: &Option<DcgcEvent>, scgc_smpl: &ndarray::Array1<f64>) -> Vec<f32> {
+    match event {
+        Some(DcgcEvent::Sample { dcgc_out, .. }) => dcgc_out.iter().map(|&v| v as f32).collect(),
+        // See the mono fallback in process_chunk.
+        _ => scgc_smpl.iter().map(|&v| v as f32).collect(),
+    }
+}
+
+fn run_binaural_inner(
+    input: &Path,
+    output: &Path,
+    params: &BuilderParams,
+    progress: &mut impl FnMut(u64),
+    cancel: &AtomicBool,
+) -> Result<AnalysisHeader, AnalysisError> {
+    let probe = probe_audio(input)?;
+    if probe.channels != 2 {
+        return Err(AnalysisError::Message(format!(
+            "binaural analysis requires a stereo input file (found {} channels)",
+            probe.channels
+        )));
+    }
+    let fs = probe.sample_rate as f64;
+    validate_gc(&params.gc, fs)?;
+    let bin = &params.binaural;
+    if !(bin.tau_max_seconds.is_finite() && bin.tau_max_seconds > 0.0) {
+        return Err(AnalysisError::Message(format!(
+            "ITD range must be positive and finite (got {:.2e} s)",
+            bin.tau_max_seconds
+        )));
+    }
+    if bin.num_tau == 0 {
+        return Err(AnalysisError::Message(
+            "EI population must contain at least one unit".into(),
+        ));
+    }
+    let units = bin.units();
+
+    let config = HybridBinauralConfig {
+        filterbank: prepared_gc(&params.gc, fs),
+        peripheral: bin.peripheral.clone(),
+        ei: EiConfig {
+            // The streaming EI stage requires causal integration; the
+            // population limit follows the configured ITD range.
+            integration_boundary: EiIntegrationBoundary::CausalZeroState,
+            max_abs_delay_seconds: bin.tau_max_seconds,
+            ..bin.ei.clone()
+        },
+    };
+    let mut stream = HybridBinauralStream::new(&units, config).map_err(message)?;
+
+    let num_ch = params.gc.num_ch;
+    let header = AnalysisHeader {
+        sample_rate: fs,
+        num_channels: num_ch as u32,
+        num_samples: 0, // patched at the end
+        f_range: params.gc.f_range,
+        control_mode: control_mode_tag(params.gc.ctrl),
+        mode: params.mode.tag(),
+        tau_seconds: units.iter().map(|unit| unit.delay_seconds).collect(),
+        channel_freqs: stream.center_frequencies_hz().to_vec(),
+    };
+
+    let file = File::create(output)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&header.encode())?;
+
+    let decoder = streaming_decoder(input)?;
+    let chunk_len = (probe.sample_rate as usize / 4).max(1); // ~0.25 s of audio
+    let mut state = BinauralState::new(chunk_len, num_ch, bin.num_tau);
+
+    let mut left_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
+    let mut right_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
+    let mut is_left = true;
+    for sample in decoder {
+        if is_left {
+            left_chunk.push(f64::from(sample));
+        } else {
+            right_chunk.push(f64::from(sample));
+        }
+        is_left = !is_left;
+        if left_chunk.len() == chunk_len && right_chunk.len() == chunk_len {
+            process_binaural_chunk(
+                &mut stream,
+                &mut state,
+                &left_chunk,
+                &right_chunk,
+                &mut writer,
+                progress,
+                cancel,
+            )?;
+            left_chunk.clear();
+            right_chunk.clear();
+        }
+    }
+    // A trailing unpaired sample (odd-length stereo) is dropped.
+    let tail_len = left_chunk.len().min(right_chunk.len());
+    if tail_len > 0 {
+        process_binaural_chunk(
+            &mut stream,
+            &mut state,
+            &left_chunk[..tail_len],
+            &right_chunk[..tail_len],
+            &mut writer,
+            progress,
+            cancel,
+        )?;
+    }
+    if stream.samples_processed() == 0 {
+        return Err(AnalysisError::Message(
+            "no decodable audio samples in input file".into(),
+        ));
+    }
+    // Flush the EI latency tail (zero-extended past the last input sample).
+    state.write_buf.clear();
+    for event in stream.finish().map_err(message)? {
+        state.emit(event)?;
+    }
+    writer.write_all(cast_slice(&state.write_buf))?;
+    if !state.pending.is_empty() {
+        return Err(AnalysisError::Message(format!(
+            "EI stage emitted no event for {} samples",
+            state.pending.len()
+        )));
+    }
+
+    finalize(writer, state.num_samples)?;
+    progress(state.num_samples);
+    Ok(AnalysisHeader {
+        num_samples: state.num_samples,
+        ..header
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_binaural_chunk(
+    stream: &mut HybridBinauralStream,
+    state: &mut BinauralState,
+    left: &[f64],
+    right: &[f64],
+    writer: &mut BufWriter<File>,
+    progress: &mut impl FnMut(u64),
+    cancel: &AtomicBool,
+) -> Result<(), AnalysisError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AnalysisError::Cancelled);
+    }
+    state.write_buf.clear();
+    for (&l, &r) in left.iter().zip(right) {
+        let step = stream.process_sample(l, r).map_err(message)?;
+        state.push_step(step)?;
+    }
+    writer.write_all(cast_slice(&state.write_buf))?;
+    progress(state.num_samples);
+    Ok(())
+}
+
+/// Patch the sample count into the header and sync the file to disk.
+fn finalize(mut writer: BufWriter<File>, num_samples: u64) -> Result<(), AnalysisError> {
+    writer.flush()?;
+    writer.seek(SeekFrom::Start(NUM_SAMPLES_OFFSET))?;
+    writer.write_all(&num_samples.to_le_bytes())?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
 /// A `.gca` file mapped into memory. The OS pages data in on demand, so the
 /// resident set stays small regardless of file size.
 pub struct AnalysisReader {
@@ -420,23 +790,24 @@ impl AnalysisReader {
                 AnalysisError::Message("invalid analysis file: truncated header".into())
             })?;
         }
-        // Decode needs the full header; read channel frequencies too. The
-        // magic must be checked first: a non-.gca file would otherwise yield
-        // a garbage (possibly huge) channel count.
+        // Decode needs the full header; read channel frequencies and EI unit
+        // delays too. The magic must be checked first: a non-.gca file would
+        // otherwise yield a garbage (possibly huge) channel count.
         if &fixed[0..4] != MAGIC {
             return Err(AnalysisError::Message(
                 "invalid analysis file: bad magic (not a .gca file)".into(),
             ));
         }
         let num_channels = u32::from_le_bytes(fixed[20..24].try_into().unwrap_or([0; 4])) as usize;
-        let header_len = FIXED_HEADER_LEN + 8 * num_channels;
+        let num_tau = u32::from_le_bytes(fixed[60..64].try_into().unwrap_or([0; 4])) as usize;
+        let header_len = FIXED_HEADER_LEN + 8 * (num_channels + num_tau);
         if file_len < header_len {
             return Err(AnalysisError::Message(
                 "invalid analysis file: truncated header".into(),
             ));
         }
         // Reads through &File share one file offset, which now sits just past
-        // the fixed header, so only the channel frequencies remain to be read.
+        // the fixed header, so only the variable header fields remain.
         let mut header_bytes = fixed.to_vec();
         header_bytes.resize(header_len, 0);
         {
@@ -449,7 +820,7 @@ impl AnalysisReader {
                 })?;
         }
         let header = AnalysisHeader::decode(&header_bytes)?;
-        let expected = header_len + header.num_samples as usize * header.num_channels as usize * 4;
+        let expected = header_len + header.num_samples as usize * header.values_per_sample() * 4;
         if file_len < expected {
             return Err(AnalysisError::Message(format!(
                 "invalid analysis file: expected at least {expected} bytes, found {file_len}"
@@ -459,14 +830,22 @@ impl AnalysisReader {
         Ok(Self { header, mmap })
     }
 
-    /// The complete sample-major matrix as `num_samples * num_channels` f32.
+    /// True for a binaural (per-ear + EI population) analysis.
+    pub fn is_binaural(&self) -> bool {
+        self.header.mode == MODE_BINAURAL
+    }
+
+    /// The complete sample-major matrix as `num_samples * values_per_sample`
+    /// f32. See the module docs for the per-sample layout.
     pub fn data(&self) -> &[f32] {
         let start = self.header.header_len();
-        let len = self.header.num_samples as usize * self.header.num_channels as usize;
+        let len = self.header.num_samples as usize * self.header.values_per_sample();
         cast_slice(&self.mmap[start..start + len * 4])
     }
 
-    /// Samples `[start, end)` as contiguous rows of `num_channels` floats.
+    /// Samples `[start, end)` of a mono analysis as contiguous rows of
+    /// `num_channels` floats. Binaural files use the dedicated per-ear
+    /// accessors instead.
     pub fn rows(&self, start: u64, end: u64) -> &[f32] {
         let num_ch = self.header.num_channels as usize;
         let start = start.min(self.header.num_samples) as usize;
@@ -474,18 +853,80 @@ impl AnalysisReader {
         &self.data()[start * num_ch..end * num_ch]
     }
 
-    /// One sample's channel vector.
+    /// One sample's channel vector of a mono analysis.
     pub fn row(&self, sample: u64) -> &[f32] {
         self.rows(sample, sample + 1)
     }
 
-    /// Per-channel peak absolute amplitude over samples `[start, end)`.
+    /// Per-channel peak absolute amplitude over samples `[start, end)` of a
+    /// mono analysis.
     pub fn column_peaks(&self, start: u64, end: u64, out: &mut [f32]) {
         out.fill(0.0);
         let num_ch = self.header.num_channels as usize;
         for row in self.rows(start, end).chunks_exact(num_ch) {
             for (peak, &value) in out.iter_mut().zip(row.iter()) {
                 *peak = peak.max(value.abs());
+            }
+        }
+    }
+
+    /// Samples `[start, end)` of a binaural analysis as contiguous
+    /// `[left | right | ei]` rows of `values_per_sample` floats.
+    fn binaural_rows(&self, start: u64, end: u64) -> &[f32] {
+        debug_assert!(self.is_binaural());
+        let stride = self.header.values_per_sample();
+        let start = start.min(self.header.num_samples) as usize;
+        let end = end.min(self.header.num_samples).max(start as u64) as usize;
+        &self.data()[start * stride..end * stride]
+    }
+
+    /// Left-ear dcGC channel vector for one sample of a binaural analysis.
+    pub fn left_row(&self, sample: u64) -> &[f32] {
+        let num_ch = self.header.num_channels as usize;
+        &self.binaural_rows(sample, sample + 1)[..num_ch]
+    }
+
+    /// Right-ear dcGC channel vector for one sample of a binaural analysis.
+    pub fn right_row(&self, sample: u64) -> &[f32] {
+        let num_ch = self.header.num_channels as usize;
+        &self.binaural_rows(sample, sample + 1)[num_ch..2 * num_ch]
+    }
+
+    /// EI activity (`num_tau × num_channels`, unit-major) for one sample of a
+    /// binaural analysis.
+    pub fn ei_row(&self, sample: u64) -> &[f32] {
+        let num_ch = self.header.num_channels as usize;
+        &self.binaural_rows(sample, sample + 1)[2 * num_ch..]
+    }
+
+    /// One-pass aggregation of a binaural column over samples `[start, end)`:
+    /// per-channel absolute peaks of both ears plus per-(unit, channel) sums
+    /// of EI activity (`ei_sums` is `num_tau × num_channels`, unit-major).
+    /// The renderer turns these into amplitude, IID, and ITD per pixel.
+    pub fn aggregate_binaural_column(
+        &self,
+        start: u64,
+        end: u64,
+        peaks_l: &mut [f32],
+        peaks_r: &mut [f32],
+        ei_sums: &mut [f32],
+    ) {
+        peaks_l.fill(0.0);
+        peaks_r.fill(0.0);
+        ei_sums.fill(0.0);
+        let num_ch = self.header.num_channels as usize;
+        let stride = self.header.values_per_sample();
+        for row in self.binaural_rows(start, end).chunks_exact(stride) {
+            let (left, rest) = row.split_at(num_ch);
+            let (right, ei) = rest.split_at(num_ch);
+            for (peak, &value) in peaks_l.iter_mut().zip(left.iter()) {
+                *peak = peak.max(value.abs());
+            }
+            for (peak, &value) in peaks_r.iter_mut().zip(right.iter()) {
+                *peak = peak.max(value.abs());
+            }
+            for (sum, &value) in ei_sums.iter_mut().zip(ei.iter()) {
+                *sum += value;
             }
         }
     }
@@ -498,16 +939,26 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let header = AnalysisHeader {
+        let mono = AnalysisHeader {
             sample_rate: 44_100.0,
             num_channels: 3,
             num_samples: 123_456,
             f_range: [40.0, 16_000.0],
             control_mode: 1,
+            mode: MODE_MONO,
+            tau_seconds: Vec::new(),
             channel_freqs: vec![40.0, 1000.0, 16_000.0],
         };
-        let decoded = AnalysisHeader::decode(&header.encode()).unwrap();
-        assert_eq!(decoded, header);
+        assert_eq!(AnalysisHeader::decode(&mono.encode()).unwrap(), mono);
+
+        let binaural = AnalysisHeader {
+            mode: MODE_BINAURAL,
+            tau_seconds: vec![-1e-3, -0.5e-3, 0.0, 0.5e-3, 1e-3],
+            ..mono.clone()
+        };
+        let decoded = AnalysisHeader::decode(&binaural.encode()).unwrap();
+        assert_eq!(decoded, binaural);
+        assert_eq!(decoded.values_per_sample(), (2 + 5) * 3);
     }
 
     #[test]
@@ -519,26 +970,37 @@ mod tests {
             num_samples: 0,
             f_range: [40.0, 16_000.0],
             control_mode: 0,
+            mode: MODE_MONO,
+            tau_seconds: Vec::new(),
             channel_freqs: vec![100.0, 200.0],
         }
         .encode();
         bytes[0] = b'X';
         assert!(AnalysisHeader::decode(&bytes).is_err());
+        // A mono header with a nonzero EI population is inconsistent.
+        let mut bytes = AnalysisHeader {
+            mode: MODE_MONO,
+            tau_seconds: vec![0.0],
+            ..AnalysisHeader {
+                sample_rate: 48_000.0,
+                num_channels: 2,
+                num_samples: 0,
+                f_range: [40.0, 16_000.0],
+                control_mode: 0,
+                mode: MODE_MONO,
+                tau_seconds: Vec::new(),
+                channel_freqs: vec![100.0, 200.0],
+            }
+        }
+        .encode();
+        bytes[60..64].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(AnalysisHeader::decode(&bytes).is_err());
     }
 
-    /// Write a 0.25 s stereo 44.1 kHz 16-bit PCM WAV containing a 1 kHz tone.
-    /// Returns the number of per-channel samples.
-    fn write_test_wav(path: &Path) -> u64 {
-        let sample_rate = 44_100_u32;
-        let num_samples = sample_rate as usize / 4;
-        let mut data = Vec::with_capacity(num_samples * 4);
-        for n in 0..num_samples {
-            let t = n as f64 / f64::from(sample_rate);
-            let value = (0.5 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() * 32_767.0) as i16;
-            data.extend_from_slice(&value.to_le_bytes());
-            data.extend_from_slice(&value.to_le_bytes());
-        }
+    /// Write a 16-bit PCM WAV. `data` is interleaved little-endian i16.
+    fn write_wav(path: &Path, sample_rate: u32, channels: u16, data: &[u8]) {
         let data_len = data.len() as u32;
+        let block_align = channels * 2;
         let mut wav = Vec::with_capacity(44 + data.len());
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36 + data_len).to_le_bytes());
@@ -546,15 +1008,72 @@ mod tests {
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&16_u32.to_le_bytes());
         wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&2_u16.to_le_bytes()); // stereo
+        wav.extend_from_slice(&channels.to_le_bytes());
         wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&(sample_rate * 4).to_le_bytes()); // byte rate
-        wav.extend_from_slice(&4_u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
         wav.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&data_len.to_le_bytes());
-        wav.extend_from_slice(&data);
+        wav.extend_from_slice(data);
         fs::write(path, wav).unwrap();
+    }
+
+    fn tone_sample(t: f64, gain: f64) -> i16 {
+        (gain * 0.5 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() * 32_767.0) as i16
+    }
+
+    /// Write a 0.25 s mono 44.1 kHz WAV containing a 1 kHz tone.
+    fn write_mono_wav(path: &Path) -> u64 {
+        let sample_rate = 44_100_u32;
+        let num_samples = sample_rate as usize / 4;
+        let mut data = Vec::with_capacity(num_samples * 2);
+        for n in 0..num_samples {
+            let t = n as f64 / f64::from(sample_rate);
+            data.extend_from_slice(&tone_sample(t, 1.0).to_le_bytes());
+        }
+        write_wav(path, sample_rate, 1, &data);
+        num_samples as u64
+    }
+
+    /// Write a 0.25 s stereo 44.1 kHz 16-bit PCM WAV containing a 1 kHz tone
+    /// identical in both ears. Returns the number of per-channel samples.
+    fn write_test_wav(path: &Path) -> u64 {
+        let sample_rate = 44_100_u32;
+        let num_samples = sample_rate as usize / 4;
+        let mut data = Vec::with_capacity(num_samples * 4);
+        for n in 0..num_samples {
+            let t = n as f64 / f64::from(sample_rate);
+            let value = tone_sample(t, 1.0);
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        write_wav(path, sample_rate, 2, &data);
+        num_samples as u64
+    }
+
+    /// Write a 0.25 s stereo tone whose right ear is delayed by
+    /// `right_delay_samples` and scaled by `right_gain` relative to the left.
+    ///
+    /// The tone is 500 Hz, comfortably below the model's 770 Hz inner-hair-
+    /// cell lowpass, so the peripheral representation retains the temporal
+    /// fine structure that carries ITD information.
+    fn write_binaural_wav(path: &Path, right_delay_samples: usize, right_gain: f64) -> u64 {
+        let sample_rate = 44_100_u32;
+        let num_samples = sample_rate as usize / 4;
+        let mut data = Vec::with_capacity(num_samples * 4);
+        for n in 0..num_samples {
+            let t = n as f64 / f64::from(sample_rate);
+            let t_right = (n as f64 - right_delay_samples as f64) / f64::from(sample_rate);
+            let left = (0.5 * (2.0 * std::f64::consts::PI * 500.0 * t).sin() * 32_767.0) as i16;
+            let right = (right_gain
+                * 0.5
+                * (2.0 * std::f64::consts::PI * 500.0 * t_right).sin()
+                * 32_767.0) as i16;
+            data.extend_from_slice(&left.to_le_bytes());
+            data.extend_from_slice(&right.to_le_bytes());
+        }
+        write_wav(path, sample_rate, 2, &data);
         num_samples as u64
     }
 
@@ -562,6 +1081,42 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pav_{name}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         (dir.join("tone.wav"), dir.join("tone.gca"))
+    }
+
+    /// Deterministic, noise-free binaural parameters with static control.
+    fn binaural_test_params() -> BuilderParams {
+        BuilderParams {
+            gc: GcParam {
+                num_ch: 32,
+                f_range: [40.0, 16_000.0],
+                ctrl: ControlMode::Static,
+                ..BuilderParams::default().gc
+            },
+            mode: AnalysisMode::Binaural,
+            binaural: BinauralParams {
+                tau_max_seconds: 1e-3,
+                num_tau: 9,
+                peripheral: PeripheralConfig {
+                    absolute_threshold_noise_level_db_spl: None,
+                    ..BinauralParams::default().peripheral
+                },
+                ei: EiConfig {
+                    internal_noise_std_mu: 0.0,
+                    ..EiConfig::streaming()
+                },
+            },
+        }
+    }
+
+    /// Channel index whose center frequency is nearest `freq` Hz.
+    fn channel_near(header: &AnalysisHeader, freq: f64) -> usize {
+        header
+            .channel_freqs
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1 - freq).abs().partial_cmp(&(b.1 - freq).abs()).unwrap())
+            .unwrap()
+            .0
     }
 
     #[test]
@@ -575,6 +1130,7 @@ mod tests {
                 f_range: [40.0, 16_000.0],
                 ..BuilderParams::default().gc
             },
+            ..BuilderParams::default()
         };
         let cancel = AtomicBool::new(false);
         let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
@@ -582,10 +1138,12 @@ mod tests {
         assert_eq!(header.sample_rate, 44_100.0);
         assert_eq!(header.num_channels, 32);
         assert_eq!(header.control_mode, control_mode_tag(ControlMode::Dynamic));
+        assert_eq!(header.mode, MODE_MONO);
         assert_eq!(header.channel_freqs.len(), 32);
 
         let reader = AnalysisReader::open(&gca).unwrap();
         assert_eq!(reader.header, header);
+        assert!(!reader.is_binaural());
         assert_eq!(reader.data().len(), expected_samples as usize * 32);
         assert_eq!(reader.row(0).len(), 32);
         assert_eq!(reader.rows(10, 20).len(), 10 * 32);
@@ -631,6 +1189,7 @@ mod tests {
                 f_range: [40.0, 23_000.0], // 44.1 kHz file → Nyquist 22.05 kHz
                 ..BuilderParams::default().gc
             },
+            ..BuilderParams::default()
         };
         let cancel = AtomicBool::new(false);
         let result = run_analysis(&wav, &gca, &params, |_| {}, &cancel);
@@ -662,6 +1221,7 @@ mod tests {
                 hloss_compression_health: Some(0.7),
                 ..BuilderParams::default().gc
             },
+            ..BuilderParams::default()
         };
         let cancel = AtomicBool::new(false);
         let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
@@ -673,6 +1233,157 @@ mod tests {
         let reader = AnalysisReader::open(&gca).unwrap();
         assert_eq!(reader.header, header);
         assert_eq!(reader.data().len(), expected_samples as usize * 16);
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    #[test]
+    fn binaural_rejects_mono_input() {
+        let (wav, gca) = temp_paths("bin_mono");
+        write_mono_wav(&wav);
+        let cancel = AtomicBool::new(false);
+        let result = run_analysis(&wav, &gca, &binaural_test_params(), |_| {}, &cancel);
+        assert!(matches!(result, Err(AnalysisError::Message(_))));
+        assert!(!gca.exists());
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    #[test]
+    fn binaural_cancel_deletes_partial_file() {
+        let (wav, gca) = temp_paths("bin_cancel");
+        write_binaural_wav(&wav, 0, 1.0);
+        let cancel = AtomicBool::new(true); // cancelled before the first chunk
+        let result = run_analysis(&wav, &gca, &binaural_test_params(), |_| {}, &cancel);
+        assert!(matches!(result, Err(AnalysisError::Cancelled)));
+        assert!(!gca.exists());
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// A right-ear delay must show up as a trough (minimum) in the summed EI
+    /// activity at the matching negative characteristic ITD: the EI stage
+    /// computes (L − R)², so the unit tuned to the stimulus ITD cancels.
+    #[test]
+    fn binaural_itd_tracks_right_ear_delay() {
+        let (wav, gca) = temp_paths("bin_itd");
+        let delay_samples = 22_usize; // ≈ 0.499 ms at 44.1 kHz
+        let expected_samples = write_binaural_wav(&wav, delay_samples, 1.0);
+
+        let params = binaural_test_params();
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, expected_samples);
+        assert_eq!(header.mode, MODE_BINAURAL);
+        assert_eq!(header.tau_seconds.len(), 9);
+        assert_eq!(header.values_per_sample(), (2 + 9) * 32);
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert!(reader.is_binaural());
+        assert_eq!(reader.header, header);
+        assert_eq!(reader.left_row(0).len(), 32);
+        assert_eq!(reader.right_row(0).len(), 32);
+        assert_eq!(reader.ei_row(0).len(), 9 * 32);
+
+        let num_ch = 32_usize;
+        let mut peaks_l = vec![0.0_f32; num_ch];
+        let mut peaks_r = vec![0.0_f32; num_ch];
+        let mut ei_sums = vec![0.0_f32; 9 * num_ch];
+        reader.aggregate_binaural_column(
+            0,
+            header.num_samples,
+            &mut peaks_l,
+            &mut peaks_r,
+            &mut ei_sums,
+        );
+        assert!(peaks_l.iter().all(|&p| p > 0.0));
+
+        let channel = channel_near(&header, 500.0);
+        let (best_unit, _) = (0..9)
+            .map(|unit| (unit, ei_sums[unit * num_ch + channel]))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        let itd = header.tau_seconds[best_unit];
+        // Paper-symmetric convention: a right-ear delay of d cancels at
+        // characteristic ITD τ = −d.
+        let expected_itd = -(delay_samples as f64 / 44_100.0);
+        assert!(
+            (itd - expected_itd).abs() <= 0.26e-3,
+            "dominant ITD {itd:.6} s, expected near {expected_itd:.6} s"
+        );
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// With static (level-independent) control the filterbank is
+    /// amplitude-linear, so a half-amplitude right ear must give an IID of
+    /// 20·log10(2) ≈ 6.02 dB from the per-ear peaks.
+    #[test]
+    fn binaural_iid_reflects_level_ratio() {
+        let (wav, gca) = temp_paths("bin_iid");
+        write_binaural_wav(&wav, 0, 0.5);
+
+        let params = binaural_test_params();
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        let num_ch = 32_usize;
+        let mut peaks_l = vec![0.0_f32; num_ch];
+        let mut peaks_r = vec![0.0_f32; num_ch];
+        let mut ei_sums = vec![0.0_f32; 9 * num_ch];
+        reader.aggregate_binaural_column(
+            0,
+            header.num_samples,
+            &mut peaks_l,
+            &mut peaks_r,
+            &mut ei_sums,
+        );
+
+        let channel = channel_near(&header, 500.0);
+        let iid_db = 20.0 * (peaks_l[channel] / peaks_r[channel]).log10();
+        assert!(
+            (iid_db - 6.02).abs() < 0.5,
+            "IID {iid_db:.2} dB, expected near 6.02 dB"
+        );
+
+        // Zero-delay input: the cancellation trough sits at τ = 0.
+        let (best_unit, _) = (0..9)
+            .map(|unit| (unit, ei_sums[unit * num_ch + channel]))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        assert_eq!(header.tau_seconds[best_unit], 0.0);
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Binaural mode also works with the default dynamic control (the hybrid
+    /// forces sample-base processing internally).
+    #[test]
+    fn binaural_dynamic_smoke() {
+        let (wav, gca) = temp_paths("bin_dyn");
+        let expected_samples = write_binaural_wav(&wav, 0, 1.0);
+
+        let params = BuilderParams {
+            mode: AnalysisMode::Binaural,
+            binaural: BinauralParams {
+                peripheral: PeripheralConfig {
+                    absolute_threshold_noise_level_db_spl: None,
+                    ..PeripheralConfig::default()
+                },
+                ei: EiConfig {
+                    internal_noise_std_mu: 0.0,
+                    ..EiConfig::streaming()
+                },
+                ..BinauralParams::default()
+            },
+            ..BuilderParams::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, expected_samples);
+        assert_eq!(header.control_mode, control_mode_tag(ControlMode::Dynamic));
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert_eq!(
+            reader.data().len(),
+            expected_samples as usize * (2 + 9) * 100
+        );
         let _ = fs::remove_dir_all(wav.parent().unwrap());
     }
 }

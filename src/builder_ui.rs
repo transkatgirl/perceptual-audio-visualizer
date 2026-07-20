@@ -10,17 +10,31 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
+use gammachirp_rs::breebaart2001::EiDelayConvention;
 use gammachirp_rs::gcfb_v234::{ControlMode, GainReference, GcParam};
 use ndarray::Array1;
 
 use crate::analysis::{
-    AnalysisError, AnalysisHeader, AudioProbe, BuilderParams, probe_audio, run_analysis,
+    AnalysisError, AnalysisHeader, AnalysisMode, AudioProbe, BuilderParams, probe_audio,
+    run_analysis,
 };
 
 const CONTROL_MODES: [(&str, ControlMode); 3] = [
     ("Dynamic", ControlMode::Dynamic),
     ("Static", ControlMode::Static),
     ("Level", ControlMode::Level),
+];
+
+/// Analysis modes offered by the builder (see `AnalysisMode`).
+const ANALYSIS_MODES: [(&str, AnalysisMode); 2] = [
+    ("Mono downmix", AnalysisMode::Mono),
+    ("Binaural (Breebaart 2001)", AnalysisMode::Binaural),
+];
+
+/// EI characteristic-delay conventions (see `EiDelayConvention`).
+const DELAY_CONVENTIONS: [(&str, EiDelayConvention); 2] = [
+    ("Paper symmetric", EiDelayConvention::PaperSymmetric),
+    ("AMT one-sided", EiDelayConvention::AmtOneSidedInteger),
 ];
 
 /// Valid `out_mid_crct` values (see `mk_filter_field2cochlea` in gammachirp-rs).
@@ -86,6 +100,28 @@ impl BuilderTab {
                 ));
             }
         }
+        if self.params.mode == AnalysisMode::Binaural {
+            let bin = &self.params.binaural;
+            if !(bin.tau_max_seconds.is_finite() && bin.tau_max_seconds > 0.0) {
+                return Some("ITD range must be positive".into());
+            }
+            if bin.num_tau == 0 {
+                return Some("EI population must have at least one unit".into());
+            }
+            if let Some(probe) = &self.probe {
+                if probe.channels != 2 {
+                    return Some("binaural analysis requires a stereo input file".into());
+                }
+                let nyquist = probe.sample_rate as f64 / 2.0;
+                if bin.peripheral.ihc_cutoff_hz >= nyquist {
+                    return Some(format!(
+                        "IHC cutoff {:.0} Hz must be below Nyquist {nyquist:.0} Hz \
+                         for this {:.0} Hz file",
+                        bin.peripheral.ihc_cutoff_hz, probe.sample_rate
+                    ));
+                }
+            }
+        }
         None
     }
 
@@ -93,7 +129,17 @@ impl BuilderTab {
         let probe = self.probe.as_ref()?;
         let duration = probe.total_duration?;
         let samples = duration.as_secs_f64() * f64::from(probe.sample_rate);
-        Some(samples as u64 * self.params.gc.num_ch as u64 * 4)
+        Some(samples as u64 * self.values_per_sample() as u64 * 4)
+    }
+
+    /// f32 values written per input sample: the GCFB channels in mono, both
+    /// ears plus the EI population (unit-major) in binaural mode.
+    fn values_per_sample(&self) -> usize {
+        let num_ch = self.params.gc.num_ch;
+        match self.params.mode {
+            AnalysisMode::Mono => num_ch,
+            AnalysisMode::Binaural => (2 + self.params.binaural.num_tau) * num_ch,
+        }
     }
 
     fn start(&mut self) {
@@ -159,6 +205,17 @@ impl BuilderTab {
     /// library computes (`hloss`, `fr1`, derived `lvl_est` values) are
     /// intentionally not shown.
     fn params_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Analysis mode");
+            egui::ComboBox::from_id_salt("analysis_mode")
+                .selected_text(analysis_mode_name(self.params.mode))
+                .show_ui(ui, |ui| {
+                    for (label, mode) in ANALYSIS_MODES {
+                        ui.selectable_value(&mut self.params.mode, mode, label);
+                    }
+                });
+        });
+
         let gc = &mut self.params.gc;
 
         egui::CollapsingHeader::new("Filterbank")
@@ -358,6 +415,188 @@ impl BuilderTab {
                 });
             });
 
+        if self.params.mode == AnalysisMode::Binaural {
+            let bin = &mut self.params.binaural;
+
+            egui::CollapsingHeader::new("EI population")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("ITD range ± (ms)");
+                        let mut tau_ms = bin.tau_max_seconds * 1e3;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut tau_ms)
+                                    .range(0.05..=5.0)
+                                    .speed(0.05),
+                            )
+                            .changed()
+                        {
+                            bin.tau_max_seconds = tau_ms * 1e-3;
+                        }
+                        ui.label("ITD units");
+                        ui.add(egui::DragValue::new(&mut bin.num_tau).range(1..=41));
+                    });
+                    ui.label(
+                        "Units are spaced linearly over ±the ITD range with zero \
+                         characteristic IID; level differences are rendered from the \
+                         per-ear outputs.",
+                    );
+                });
+
+            egui::CollapsingHeader::new("EI stage (Breebaart 2001)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let ei = &mut bin.ei;
+                    egui::Grid::new("ei_stage_grid")
+                        .num_columns(4)
+                        .show(ui, |ui| {
+                            ui.label("Integration time constant (ms)");
+                            let mut tau_ms = ei.integration_time_constant_seconds * 1e3;
+                            if ui
+                                .add(egui::DragValue::new(&mut tau_ms).range(1.0..=200.0))
+                                .changed()
+                            {
+                                ei.integration_time_constant_seconds = tau_ms * 1e-3;
+                            }
+                            ui.label("Compression a");
+                            ui.add(
+                                egui::DragValue::new(&mut ei.compression_a)
+                                    .range(0.001..=1.0)
+                                    .speed(0.01),
+                            );
+                            ui.end_row();
+
+                            ui.label("Compression b");
+                            ui.add(
+                                egui::DragValue::new(&mut ei.compression_b)
+                                    .range(1e-7..=1e-2)
+                                    .speed(1e-6),
+                            );
+                            ui.label("Delay-weight time constant (ms)");
+                            let mut weight_ms = ei.delay_weight_time_constant_seconds * 1e3;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut weight_ms)
+                                        .range(0.1..=20.0)
+                                        .speed(0.1),
+                                )
+                                .changed()
+                            {
+                                ei.delay_weight_time_constant_seconds = weight_ms * 1e-3;
+                            }
+                            ui.end_row();
+
+                            ui.label("Delay convention");
+                            egui::ComboBox::from_id_salt("ei_delay_convention")
+                                .selected_text(delay_convention_name(ei.delay_convention))
+                                .show_ui(ui, |ui| {
+                                    for (label, convention) in DELAY_CONVENTIONS {
+                                        ui.selectable_value(
+                                            &mut ei.delay_convention,
+                                            convention,
+                                            label,
+                                        );
+                                    }
+                                });
+                            ui.label("Internal noise σ (MU)");
+                            ui.add(
+                                egui::DragValue::new(&mut ei.internal_noise_std_mu)
+                                    .range(0.0..=10.0)
+                                    .speed(0.1),
+                            );
+                            ui.end_row();
+
+                            ui.label("Noise seed");
+                            ui.add(egui::DragValue::new(&mut ei.noise_seed));
+                            ui.end_row();
+                        });
+                    ui.label("Integration boundary: causal zero-state (required for streaming)");
+                });
+
+            egui::CollapsingHeader::new("Peripheral (IHC & adaptation)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let per = &mut bin.peripheral;
+                    ui.horizontal(|ui| {
+                        ui.label("IHC lowpass cutoff (Hz)");
+                        ui.add(
+                            egui::DragValue::new(&mut per.ihc_cutoff_hz)
+                                .range(100.0..=4000.0)
+                                .speed(10.0),
+                        );
+                        ui.label("Minimum level (dB SPL)");
+                        ui.add(
+                            egui::DragValue::new(&mut per.minimum_level_db_spl)
+                                .range(-20.0..=40.0)
+                                .speed(1.0),
+                        );
+                    });
+                    ui.label("Adaptation time constants (s):");
+                    egui::Grid::new("adaptation_tc_grid")
+                        .num_columns(5)
+                        .show(ui, |ui| {
+                            for loop_index in 1..=per.adaptation_time_constants_seconds.len() {
+                                ui.label(format!("Loop {loop_index}"));
+                            }
+                            ui.end_row();
+                            for tc in per.adaptation_time_constants_seconds.iter_mut() {
+                                ui.add(
+                                    egui::DragValue::new(tc).range(0.001..=2.0).speed(0.001),
+                                );
+                            }
+                            ui.end_row();
+                        });
+                    ui.horizontal(|ui| {
+                        let mut limited = per.overshoot_limit.is_some();
+                        if ui.checkbox(&mut limited, "Overshoot limit").changed() {
+                            per.overshoot_limit = limited.then_some(10.0);
+                        }
+                        if let Some(limit) = &mut per.overshoot_limit {
+                            ui.add(egui::DragValue::new(limit).range(1.0..=100.0).speed(0.5))
+                                .on_hover_text(
+                                    "AMT smooth limiter applied inside each adaptation loop; \
+                                     unchecked keeps the paper's unlimited response",
+                                );
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let mut calibrated = per.amplitude_one_db_spl.is_some();
+                        if ui
+                            .checkbox(&mut calibrated, "Amplitude-one level")
+                            .on_hover_text("dcGC amplitude 1 ↔ dB SPL")
+                            .changed()
+                        {
+                            per.amplitude_one_db_spl = calibrated.then_some(100.0);
+                        }
+                        if let Some(db) = &mut per.amplitude_one_db_spl {
+                            ui.add(egui::DragValue::new(db).range(60.0..=120.0).speed(1.0));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let mut noise_on = per.absolute_threshold_noise_level_db_spl.is_some();
+                        if ui
+                            .checkbox(&mut noise_on, "Absolute-threshold noise")
+                            .changed()
+                        {
+                            per.absolute_threshold_noise_level_db_spl = noise_on.then_some(9.54);
+                        }
+                        if let Some(db) = &mut per.absolute_threshold_noise_level_db_spl {
+                            ui.add(
+                                egui::DragValue::new(db)
+                                    .range(-20.0..=40.0)
+                                    .speed(0.5)
+                                    .suffix(" dB SPL"),
+                            );
+                        }
+                        ui.label("Noise seed");
+                        ui.add(egui::DragValue::new(
+                            &mut per.absolute_threshold_noise_seed,
+                        ));
+                    });
+                });
+        }
+
         ui.add_space(4.0);
         if ui.button("Reset parameters to defaults").clicked() {
             self.params = BuilderParams::default();
@@ -373,11 +612,20 @@ impl BuilderTab {
 
         ui.heading("Analysis builder");
         ui.add_space(4.0);
-        ui.label(
-            "Offline per-sample GCFB v2.34 analysis. The audio is decoded, downmixed to \
-             mono, and streamed through the filterbank one sample at a time; results are \
-             written straight to disk, so files larger than RAM are fine.",
-        );
+        let mode_blurb = match self.params.mode {
+            AnalysisMode::Mono => {
+                "decoded, downmixed to mono, and streamed through the filterbank"
+            }
+            AnalysisMode::Binaural => {
+                "decoded as stereo and streamed through per-ear filterbanks plus a \
+                 Breebaart-2001 EI population"
+            }
+        };
+        ui.label(format!(
+            "Offline per-sample GCFB v2.34 analysis. The audio is {mode_blurb} one sample \
+             at a time; results are written straight to disk, so files larger than RAM are \
+             fine."
+        ));
         ui.add_space(8.0);
 
         let enabled = !running;
@@ -437,15 +685,15 @@ impl BuilderTab {
         ui.add_space(8.0);
         if let Some(bytes) = self.estimated_bytes() {
             ui.label(format!(
-                "Estimated output size: {} ({} ch × 4 B × per-sample)",
+                "Estimated output size: {} ({} values × 4 B × per-sample)",
                 human_bytes(bytes),
-                self.params.gc.num_ch
+                self.values_per_sample()
             ));
         } else if let Some(probe) = &self.probe {
             ui.label(format!(
-                "Output size: ~{}/s of audio at {} channels",
-                human_bytes(u64::from(probe.sample_rate) * self.params.gc.num_ch as u64 * 4),
-                self.params.gc.num_ch
+                "Output size: ~{}/s of audio at {} values per sample",
+                human_bytes(u64::from(probe.sample_rate) * self.values_per_sample() as u64 * 4),
+                self.values_per_sample()
             ));
         }
 
@@ -504,6 +752,22 @@ fn control_mode_name(mode: ControlMode) -> &'static str {
     CONTROL_MODES
         .iter()
         .find(|(_, candidate)| *candidate == mode)
+        .map(|(label, _)| *label)
+        .unwrap_or("Unknown")
+}
+
+fn analysis_mode_name(mode: AnalysisMode) -> &'static str {
+    ANALYSIS_MODES
+        .iter()
+        .find(|(_, candidate)| *candidate == mode)
+        .map(|(label, _)| *label)
+        .unwrap_or("Unknown")
+}
+
+fn delay_convention_name(convention: EiDelayConvention) -> &'static str {
+    DELAY_CONVENTIONS
+        .iter()
+        .find(|(_, candidate)| *candidate == convention)
         .map(|(label, _)| *label)
         .unwrap_or("Unknown")
 }

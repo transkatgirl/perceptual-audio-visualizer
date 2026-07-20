@@ -8,7 +8,9 @@ use std::time::Duration;
 use eframe::egui;
 use rodio::{DeviceSinkBuilder, Player};
 
-use crate::analysis::{AnalysisReader, control_mode_label, probe_audio, streaming_decoder};
+use crate::analysis::{
+    AnalysisReader, control_mode_label, mode_label, probe_audio, streaming_decoder,
+};
 
 /// Spectrogram texture width in columns; the visible window is always exactly
 /// this many columns wide, so zoom level maps to samples-per-column.
@@ -110,7 +112,7 @@ impl ViewerTab {
         self.ceil_db = auto_ceiling(&reader, self.view_start, self.view_span);
         self.follow = true;
         self.loaded = Some(Loaded {
-            spec: Spectrogram::new(ctx, reader.header.num_channels as usize),
+            spec: Spectrogram::new(ctx, &reader),
             reader,
             audio_path: audio.to_path_buf(),
             playback,
@@ -173,16 +175,30 @@ impl ViewerTab {
         };
 
         let header = &loaded.reader.header;
-        ui.label(format!(
-            "{:.0} Hz · {} ch · {:.0}–{:.0} Hz · {} · {} ({})",
+        let mut info = format!(
+            "{:.0} Hz · {} ch · {:.0}–{:.0} Hz · {} · {} · {} ({})",
             header.sample_rate,
             header.num_channels,
             header.f_range[0],
             header.f_range[1],
+            mode_label(header.mode),
             control_mode_label(header.control_mode),
             fmt_time(header.duration()),
-            crate::builder_ui::human_bytes(header.num_samples * u64::from(header.num_channels) * 4),
-        ));
+            crate::builder_ui::human_bytes(header.num_samples * header.values_per_sample() as u64 * 4),
+        );
+        if loaded.reader.is_binaural() {
+            let tau_max_ms = header
+                .tau_seconds
+                .iter()
+                .map(|tau| tau.abs())
+                .fold(0.0_f64, f64::max)
+                * 1000.0;
+            info = format!(
+                "{info} · {} EI units, ±{tau_max_ms:.1} ms",
+                header.tau_seconds.len()
+            );
+        }
+        ui.label(info);
         ui.add_space(4.0);
 
         // Keyboard transport (when no text field has focus).
@@ -427,15 +443,49 @@ impl ViewerTab {
             let ch = (num_ch as f32 * (1.0 - ch_frac)) as usize;
             let ch = ch.min(num_ch - 1);
             let sample = (time * fs).clamp(0.0, (loaded.reader.header.num_samples - 1) as f64);
-            let value = loaded.reader.row(sample as u64)[ch];
-            let db = 20.0 * (value.abs() + 1e-12).log10();
-            response.clone().on_hover_text(format!(
-                "{} · {:.0} Hz (ch {}) · {:.1} dB",
-                fmt_time(time),
-                loaded.reader.header.channel_freqs[ch],
-                ch,
-                db
-            ));
+            if loaded.reader.is_binaural() {
+                let left = loaded.reader.left_row(sample as u64)[ch].abs();
+                let right = loaded.reader.right_row(sample as u64)[ch].abs();
+                let db = 20.0 * ((left + right) / 2.0 + 1e-12).log10();
+                let stereo = match loaded.spec.stereo_var {
+                    StereoVar::Iid => format!(
+                        "{:+.1} dB IID",
+                        20.0 * ((left + 1e-12) / (right + 1e-12)).log10()
+                    ),
+                    StereoVar::Itd => {
+                        // Same trough-picking as the renderer (see render_column).
+                        let ei = loaded.reader.ei_row(sample as u64);
+                        let mut unit = 0;
+                        let mut min = f32::INFINITY;
+                        for u in 0..loaded.reader.header.tau_seconds.len() {
+                            let value = ei[u * num_ch + ch];
+                            if value < min {
+                                min = value;
+                                unit = u;
+                            }
+                        }
+                        format!("{:.2} ms ITD", loaded.reader.header.tau_seconds[unit] * 1e3)
+                    }
+                };
+                response.clone().on_hover_text(format!(
+                    "{} · {:.0} Hz (ch {}) · {:.1} dB · {}",
+                    fmt_time(time),
+                    loaded.reader.header.channel_freqs[ch],
+                    ch,
+                    db,
+                    stereo
+                ));
+            } else {
+                let value = loaded.reader.row(sample as u64)[ch];
+                let db = 20.0 * (value.abs() + 1e-12).log10();
+                response.clone().on_hover_text(format!(
+                    "{} · {:.0} Hz (ch {}) · {:.1} dB",
+                    fmt_time(time),
+                    loaded.reader.header.channel_freqs[ch],
+                    ch,
+                    db
+                ));
+            }
         }
 
         // Bottom bar: dB range controls.
@@ -455,6 +505,34 @@ impl ViewerTab {
                     *floor_db = *ceil_db - 6.0;
                 }
                 loaded.spec.invalidate();
+            }
+            if loaded.reader.is_binaural() {
+                ui.separator();
+                let mut stereo_changed = false;
+                egui::ComboBox::from_label("Stereo variable")
+                    .selected_text(match loaded.spec.stereo_var {
+                        StereoVar::Iid => "IID",
+                        StereoVar::Itd => "ITD",
+                    })
+                    .show_ui(ui, |ui| {
+                        stereo_changed |= ui
+                            .selectable_value(&mut loaded.spec.stereo_var, StereoVar::Iid, "IID")
+                            .changed();
+                        stereo_changed |= ui
+                            .selectable_value(&mut loaded.spec.stereo_var, StereoVar::Itd, "ITD")
+                            .changed();
+                    });
+                if loaded.spec.stereo_var == StereoVar::Iid {
+                    stereo_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut loaded.spec.iid_range_db, 1.0..=40.0)
+                                .text("IID range ±dB"),
+                        )
+                        .changed();
+                }
+                if stereo_changed {
+                    loaded.spec.invalidate();
+                }
             }
             ui.separator();
             ui.label("Space: play/pause · ←/→: seek (Shift = 5 s) · drag: scrub · wheel: pan · pinch/ctrl-wheel: zoom");
@@ -572,13 +650,44 @@ struct Spectrogram {
     dirty: bool,
     peaks: Vec<f32>,
     lut: Vec<egui::Color32>,
+    /// Binaural rendering state; `peaks_r`, `ei_sums`, and `lut2d` stay empty
+    /// for mono analyses, and `peaks` doubles as the left-ear peaks buffer.
+    binaural: bool,
+    num_tau: usize,
+    tau_max: f32,
+    stereo_var: StereoVar,
+    iid_range_db: f32,
+    peaks_r: Vec<f32>,
+    ei_sums: Vec<f32>,
+    lut2d: Vec<egui::Color32>,
+}
+
+/// Which interaural variable drives the hue of a binaural spectrogram;
+/// the downmixed amplitude always drives lightness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StereoVar {
+    /// Interaural intensity difference from the per-ear peaks.
+    #[default]
+    Iid,
+    /// Interaural time difference from the EI population trough.
+    Itd,
 }
 
 impl Spectrogram {
-    fn new(ctx: &egui::Context, num_ch: usize) -> Self {
+    fn new(ctx: &egui::Context, reader: &AnalysisReader) -> Self {
+        let num_ch = reader.header.num_channels as usize;
         let image =
             egui::ColorImage::new([TEX_W, num_ch], vec![egui::Color32::BLACK; TEX_W * num_ch]);
         let texture = ctx.load_texture("spectrogram", image.clone(), egui::TextureOptions::NEAREST);
+        let binaural = reader.is_binaural();
+        let num_tau = reader.header.tau_seconds.len();
+        let tau_max = reader
+            .header
+            .tau_seconds
+            .iter()
+            .map(|tau| tau.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1e-12) as f32;
         Self {
             texture,
             image,
@@ -589,6 +698,22 @@ impl Spectrogram {
             dirty: false,
             peaks: vec![0.0; num_ch],
             lut: magma_lut(),
+            binaural,
+            num_tau,
+            tau_max,
+            stereo_var: StereoVar::default(),
+            iid_range_db: 20.0,
+            peaks_r: if binaural { vec![0.0; num_ch] } else { Vec::new() },
+            ei_sums: if binaural {
+                vec![0.0; num_tau * num_ch]
+            } else {
+                Vec::new()
+            },
+            lut2d: if binaural {
+                crate::colormap::bivariate_lut()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -648,8 +773,51 @@ impl Spectrogram {
         let b = (((p + 1) as f64 * self.spp) as u64)
             .max(a + 1)
             .min(num_samples);
-        reader.column_peaks(a, b, &mut self.peaks);
         let span = (ceil_db - floor_db).max(1e-6);
+        if self.binaural {
+            reader.aggregate_binaural_column(
+                a,
+                b,
+                &mut self.peaks,
+                &mut self.peaks_r,
+                &mut self.ei_sums,
+            );
+            for ch in 0..self.num_ch {
+                let amp = (self.peaks[ch] + self.peaks_r[ch]) / 2.0;
+                let db = 20.0 * (amp + 1e-12).log10();
+                let t = ((db - floor_db) / span).clamp(0.0, 1.0);
+                let s = match self.stereo_var {
+                    StereoVar::Iid => {
+                        let iid_db = 20.0
+                            * ((self.peaks[ch] + 1e-12) / (self.peaks_r[ch] + 1e-12)).log10();
+                        (iid_db / self.iid_range_db + 1.0) / 2.0
+                    }
+                    StereoVar::Itd => {
+                        // The EI stage integrates (L − R)², so the unit tuned to
+                        // the stimulus ITD cancels it: the ITD is the trough.
+                        let mut unit = 0;
+                        let mut min = f32::INFINITY;
+                        for u in 0..self.num_tau {
+                            let sum = self.ei_sums[u * self.num_ch + ch];
+                            if sum < min {
+                                min = sum;
+                                unit = u;
+                            }
+                        }
+                        let tau = reader.header.tau_seconds[unit] as f32;
+                        (tau / self.tau_max + 1.0) / 2.0
+                    }
+                };
+                let s = s.clamp(0.0, 1.0);
+                let color = self.lut2d[(t * 255.0) as usize * 256 + (s * 255.0) as usize];
+                // Row 0 is the top of the image; put low frequencies at the bottom.
+                let y = self.num_ch - 1 - ch;
+                self.image.pixels[y * TEX_W + x] = color;
+            }
+            self.dirty = true;
+            return;
+        }
+        reader.column_peaks(a, b, &mut self.peaks);
         for ch in 0..self.num_ch {
             let db = 20.0 * (self.peaks[ch] + 1e-12).log10();
             let t = ((db - floor_db) / span).clamp(0.0, 1.0);
@@ -667,14 +835,30 @@ fn auto_ceiling(reader: &AnalysisReader, view_start: f64, view_span: f64) -> f32
     let spp = view_span * fs / TEX_W as f64;
     let p0 = (view_start * TEX_W as f64 / view_span).max(0.0) as u64;
     let mut max = 0.0_f32;
-    let mut peaks = vec![0.0_f32; reader.header.num_channels as usize];
-    for i in 0..64_u64 {
-        let p = p0 + i * (TEX_W as u64 / 64);
-        let a = (p as f64 * spp) as u64;
-        let b = (((p + 1) as f64 * spp) as u64).max(a + 1);
-        reader.column_peaks(a, b, &mut peaks);
-        for &v in &peaks {
-            max = max.max(v);
+    let num_ch = reader.header.num_channels as usize;
+    let mut peaks = vec![0.0_f32; num_ch];
+    if reader.is_binaural() {
+        // Ceiling from the per-ear peaks downmixed to mono.
+        let mut peaks_r = vec![0.0_f32; num_ch];
+        let mut ei_sums = vec![0.0_f32; reader.header.tau_seconds.len() * num_ch];
+        for i in 0..64_u64 {
+            let p = p0 + i * (TEX_W as u64 / 64);
+            let a = (p as f64 * spp) as u64;
+            let b = (((p + 1) as f64 * spp) as u64).max(a + 1);
+            reader.aggregate_binaural_column(a, b, &mut peaks, &mut peaks_r, &mut ei_sums);
+            for ch in 0..num_ch {
+                max = max.max((peaks[ch] + peaks_r[ch]) / 2.0);
+            }
+        }
+    } else {
+        for i in 0..64_u64 {
+            let p = p0 + i * (TEX_W as u64 / 64);
+            let a = (p as f64 * spp) as u64;
+            let b = (((p + 1) as f64 * spp) as u64).max(a + 1);
+            reader.column_peaks(a, b, &mut peaks);
+            for &v in &peaks {
+                max = max.max(v);
+            }
         }
     }
     (20.0 * (max + 1e-12).log10()).ceil()
