@@ -308,7 +308,7 @@ impl Default for BuilderParams {
     fn default() -> Self {
         Self {
             gc: GcParam {
-                num_ch: 100,
+                num_ch: 300,
                 f_range: [40.0, 16_000.0],
                 out_mid_crct: "ELC".into(),
                 ctrl: ControlMode::Dynamic,
@@ -503,9 +503,7 @@ impl AnalysisHeader {
         }
         let mut scales = Vec::with_capacity(num_scales);
         for index in 0..num_scales {
-            scales.push(read_f64(
-                FIXED_HEADER_LEN + 8 * (fixed_counts + index),
-            ));
+            scales.push(read_f64(FIXED_HEADER_LEN + 8 * (fixed_counts + index)));
         }
         Ok(Self {
             sample_rate: read_f64(12),
@@ -579,7 +577,10 @@ fn validate_consensus(config: &BandwidthConsensusStreamConfig) -> Result<(), Ana
                 .into(),
         ));
     }
-    if scales.iter().any(|scale| !scale.is_finite() || *scale <= 0.0) {
+    if scales
+        .iter()
+        .any(|scale| !scale.is_finite() || *scale <= 0.0)
+    {
         return Err(AnalysisError::Message(
             "bandwidth consensus scales must be positive and finite".into(),
         ));
@@ -854,8 +855,7 @@ impl Chain {
             }
             AnalysisValues::Consensus(config) => {
                 validate_consensus(config)?;
-                let stream =
-                    BandwidthConsensusStream::new(gc, config.clone()).map_err(message)?;
+                let stream = BandwidthConsensusStream::new(gc, config.clone()).map_err(message)?;
                 Ok(Self::Consensus(Box::new(stream)))
             }
         }
@@ -924,9 +924,13 @@ impl Chain {
 /// example's rendering: bins failing the required agreement carry no
 /// salience.
 fn gated_salience(frame: &BandwidthConsensusStreamFrame) -> Array1<f64> {
-    Array1::from_iter(frame.salience.iter().zip(&frame.consensus_mask).map(
-        |(&salience, &accepted)| if accepted { salience } else { 0.0 },
-    ))
+    Array1::from_iter(
+        frame
+            .salience
+            .iter()
+            .zip(&frame.consensus_mask)
+            .map(|(&salience, &accepted)| if accepted { salience } else { 0.0 }),
+    )
 }
 
 /// Deposit one causal reassignment step into the rolling target map with
@@ -1711,8 +1715,7 @@ impl AnalysisReader {
                 "invalid analysis file: bad magic (not a .gca file)".into(),
             ));
         }
-        let header_len =
-            u32::from_le_bytes(fixed[52..56].try_into().unwrap_or([0; 4])) as usize;
+        let header_len = u32::from_le_bytes(fixed[52..56].try_into().unwrap_or([0; 4])) as usize;
         if header_len < FIXED_HEADER_LEN
             || header_len > file_len
             || !(header_len - FIXED_HEADER_LEN).is_multiple_of(8)
@@ -1754,7 +1757,11 @@ impl AnalysisReader {
             complete = false;
         }
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { header, mmap, complete })
+        Ok(Self {
+            header,
+            mmap,
+            complete,
+        })
     }
 
     /// False if the file was opened before its sample count was finalized
@@ -1915,7 +1922,10 @@ mod tests {
             scales: vec![0.8, 1.0, 1.2],
             ..mono.clone()
         };
-        assert_eq!(AnalysisHeader::decode(&salience.encode()).unwrap(), salience);
+        assert_eq!(
+            AnalysisHeader::decode(&salience.encode()).unwrap(),
+            salience
+        );
 
         let reassigned = AnalysisHeader {
             value_kind: VALUE_REASSIGNED,
