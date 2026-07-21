@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use eframe::egui;
 use gammachirp_rs::breebaart2001::EiDelayConvention;
-use gammachirp_rs::gcfb_v234::{ControlMode, GainReference, GcParam};
+use gammachirp_rs::gcfb_v234::{
+    BandwidthConsensusStreamConfig, ControlMode, GainReference, GcParam,
+};
 use ndarray::Array1;
 
 use crate::analysis::{
-    AnalysisError, AnalysisHeader, AnalysisMode, AudioProbe, BuilderParams, probe_audio,
-    run_analysis,
+    AnalysisError, AnalysisHeader, AnalysisMode, AnalysisValues, AudioProbe, BuilderParams,
+    probe_audio, run_analysis,
 };
 
 const CONTROL_MODES: [(&str, ControlMode); 3] = [
@@ -30,6 +32,67 @@ const ANALYSIS_MODES: [(&str, AnalysisMode); 2] = [
     ("Mono downmix", AnalysisMode::Mono),
     ("Binaural (Breebaart 2001)", AnalysisMode::Binaural),
 ];
+
+/// Stored-value kinds offered by the builder (see `AnalysisValues`).
+const STORED_VALUES: [(&str, StoredValues); 3] = [
+    ("dcGC amplitudes", StoredValues::Amplitudes),
+    (
+        "Reassigned energy (spectral reassignment)",
+        StoredValues::Reassigned,
+    ),
+    (
+        "Consensus salience (bandwidth consensus)",
+        StoredValues::Salience,
+    ),
+];
+
+/// Builder-UI view of the `AnalysisValues` choice; the consensus
+/// configuration itself lives in `BuilderParams::values`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredValues {
+    Amplitudes,
+    Reassigned,
+    Salience,
+}
+
+fn stored_values_of(values: &AnalysisValues) -> StoredValues {
+    match values {
+        AnalysisValues::Amplitude => StoredValues::Amplitudes,
+        AnalysisValues::Reassigned => StoredValues::Reassigned,
+        AnalysisValues::Consensus(_) => StoredValues::Salience,
+    }
+}
+
+const DEFAULT_SCALES_TEXT: &str = "0.8, 1.0, 1.2";
+
+/// Parse a comma/space-separated bandwidth-scale list, applying the library's
+/// consensus rules (at least two unique positive scales, exactly one 1.0).
+fn parse_scales(text: &str) -> Result<Vec<f64>, String> {
+    let scales: Vec<f64> = text
+        .split([',', ' '])
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            token
+                .parse::<f64>()
+                .map_err(|_| format!("cannot parse scale '{token}'"))
+        })
+        .collect::<Result<_, _>>()?;
+    if scales.len() < 2 {
+        return Err("at least two scales are required".into());
+    }
+    if scales.iter().any(|scale| !scale.is_finite() || *scale <= 0.0) {
+        return Err("scales must be positive and finite".into());
+    }
+    for (index, scale) in scales.iter().enumerate() {
+        if scales[..index].contains(scale) {
+            return Err("scales must be unique".into());
+        }
+    }
+    if scales.iter().filter(|&&scale| scale == 1.0).count() != 1 {
+        return Err("exactly one 1.0 baseline scale is required".into());
+    }
+    Ok(scales)
+}
 
 /// EI characteristic-delay conventions (see `EiDelayConvention`).
 const DELAY_CONVENTIONS: [(&str, EiDelayConvention); 2] = [
@@ -61,22 +124,58 @@ struct RunningState {
     rx: Receiver<BuilderMsg>,
 }
 
-#[derive(Default)]
 pub struct BuilderTab {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     probe: Option<AudioProbe>,
     params: BuilderParams,
+    scales_text: String,
+    window_override: bool,
+    window_ms: f64,
     running: Option<RunningState>,
     done_samples: u64,
     status: String,
     status_is_error: bool,
 }
 
+impl Default for BuilderTab {
+    fn default() -> Self {
+        Self {
+            input: None,
+            output: None,
+            probe: None,
+            params: BuilderParams::default(),
+            scales_text: DEFAULT_SCALES_TEXT.into(),
+            window_override: false,
+            window_ms: 100.0,
+            running: None,
+            done_samples: 0,
+            status: String::new(),
+            status_is_error: false,
+        }
+    }
+}
+
 impl BuilderTab {
     fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
         self.status = text.into();
         self.status_is_error = is_error;
+    }
+
+    /// Switch the stored-value kind, keeping the consensus configuration in
+    /// sync with the scales text field.
+    fn set_stored_values(&mut self, stored: StoredValues) {
+        self.params.values = match stored {
+            StoredValues::Amplitudes => AnalysisValues::Amplitude,
+            StoredValues::Reassigned => AnalysisValues::Reassigned,
+            StoredValues::Salience => {
+                let mut config = BandwidthConsensusStreamConfig::default();
+                if let Ok(scales) = parse_scales(&self.scales_text) {
+                    config.scales = scales;
+                }
+                AnalysisValues::Consensus(config)
+            }
+        };
     }
 
     fn validation_error(&self) -> Option<String> {
@@ -98,6 +197,20 @@ impl BuilderTab {
                      for this {:.0} Hz file",
                     f_range[1], probe.sample_rate
                 ));
+            }
+        }
+        if let AnalysisValues::Consensus(config) = &self.params.values {
+            if let Err(error) = parse_scales(&self.scales_text) {
+                return Some(format!("bandwidth scales: {error}"));
+            }
+            if !(config.relative_support_floor > 0.0 && config.relative_support_floor < 1.0) {
+                return Some("support floor must be in (0, 1)".into());
+            }
+            if !(config.required_agreement > 0.0 && config.required_agreement <= 1.0) {
+                return Some("required agreement must be in (0, 1]".into());
+            }
+            if self.window_override && self.probe.is_none() {
+                return Some("probe the input file to set the window in milliseconds".into());
             }
         }
         if self.params.mode == AnalysisMode::Binaural {
@@ -150,7 +263,16 @@ impl BuilderTab {
         let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else {
             return;
         };
-        let params = self.params.clone();
+        let mut params = self.params.clone();
+        if let AnalysisValues::Consensus(config) = &mut params.values {
+            config.window_samples = if self.window_override {
+                // The probe is guaranteed by validation_error in this state.
+                let fs = self.probe.as_ref().map(|probe| probe.sample_rate).unwrap_or(1);
+                Some(((self.window_ms * 1e-3 * f64::from(fs)).round() as usize).max(1))
+            } else {
+                None // library-derived: the longest causal atom
+            };
+        }
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
@@ -218,7 +340,25 @@ impl BuilderTab {
                         ui.selectable_value(&mut self.params.mode, mode, label);
                     }
                 });
+            ui.label("Stored values");
+            let current = stored_values_of(&self.params.values);
+            egui::ComboBox::from_id_salt("stored_values")
+                .selected_text(stored_values_name(current))
+                .show_ui(ui, |ui| {
+                    for (label, stored) in STORED_VALUES {
+                        if ui
+                            .selectable_label(current == stored, label)
+                            .clicked()
+                        {
+                            self.set_stored_values(stored);
+                        }
+                    }
+                });
         });
+
+        if matches!(self.params.values, AnalysisValues::Consensus(_)) {
+            self.consensus_ui(ui);
+        }
 
         let gc = &mut self.params.gc;
 
@@ -614,7 +754,73 @@ impl BuilderTab {
         ui.add_space(4.0);
         if ui.button("Reset parameters to defaults").clicked() {
             self.params = BuilderParams::default();
+            self.scales_text = DEFAULT_SCALES_TEXT.into();
+            self.window_override = false;
+            self.window_ms = 100.0;
         }
+    }
+
+    /// Consensus configuration, shown when "Consensus salience" is selected.
+    fn consensus_ui(&mut self, ui: &mut egui::Ui) {
+        let scales_text = &mut self.scales_text;
+        let window_override = &mut self.window_override;
+        let window_ms = &mut self.window_ms;
+        let AnalysisValues::Consensus(config) = &mut self.params.values else {
+            return;
+        };
+        egui::CollapsingHeader::new("Bandwidth consensus")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Bandwidth scales");
+                    if ui
+                        .add(egui::TextEdit::singleline(scales_text).desired_width(160.0))
+                        .on_hover_text(
+                            "Comma-separated multipliers applied to b1, b2, and lvl_est.b2; \
+                             exactly one must be 1.0 (the unscaled baseline)",
+                        )
+                        .changed()
+                        && let Ok(scales) = parse_scales(scales_text)
+                    {
+                        config.scales = scales;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Relative support floor");
+                    ui.add(
+                        egui::DragValue::new(&mut config.relative_support_floor)
+                            .range(1e-9..=0.5)
+                            .speed(1e-6),
+                    )
+                    .on_hover_text(
+                        "A normalized per-scale map supports a bin only above this \
+                         fraction of its rolling maximum",
+                    );
+                    ui.label("Required agreement");
+                    ui.add(egui::Slider::new(&mut config.required_agreement, 0.05..=1.0))
+                        .on_hover_text(
+                            "Minimum fraction of scales that must support a bin; salience \
+                             is the corresponding order statistic of the normalized maps",
+                        );
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(window_override, "Override rolling window");
+                    if *window_override {
+                        ui.add(
+                            egui::DragValue::new(window_ms)
+                                .range(1.0..=2000.0)
+                                .speed(1.0)
+                                .suffix(" ms"),
+                        );
+                    }
+                });
+                ui.label(
+                    "One full reassignment chain runs per scale (per ear in binaural mode). \
+                     Salience is mask-gated: bins failing the required agreement are stored \
+                     as 0. The rolling normalization window defaults to the longest causal \
+                     atom.",
+                );
+            });
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -635,10 +841,20 @@ impl BuilderTab {
                  Breebaart-2001 EI population"
             }
         };
+        let values_blurb: String = match &self.params.values {
+            AnalysisValues::Amplitude => "dcGC amplitudes are stored".into(),
+            AnalysisValues::Reassigned => {
+                "causally reassigned energy is stored (one reassignment chain per ear)".into()
+            }
+            AnalysisValues::Consensus(config) => format!(
+                "mask-gated consensus salience is stored ({} reassignment chains per ear)",
+                config.scales.len()
+            ),
+        };
         ui.label(format!(
             "Offline per-sample GCFB v2.34 analysis. The audio is {mode_blurb} one sample \
-             at a time; results are written straight to disk, so files larger than RAM are \
-             fine."
+             at a time and {values_blurb}; results are written straight to disk, so files \
+             larger than RAM are fine."
         ));
         ui.add_space(8.0);
 
@@ -774,6 +990,14 @@ fn analysis_mode_name(mode: AnalysisMode) -> &'static str {
     ANALYSIS_MODES
         .iter()
         .find(|(_, candidate)| *candidate == mode)
+        .map(|(label, _)| *label)
+        .unwrap_or("Unknown")
+}
+
+fn stored_values_name(stored: StoredValues) -> &'static str {
+    STORED_VALUES
+        .iter()
+        .find(|(_, candidate)| *candidate == stored)
         .map(|(label, _)| *label)
         .unwrap_or("Unknown")
 }

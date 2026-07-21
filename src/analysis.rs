@@ -14,21 +14,31 @@
 //! 32  f64  f_range_low
 //! 40  f64  f_range_high
 //! 48  u32  control_mode (0=Static, 1=Dynamic, 2=Level)
-//! 52  u32  header_len = 68 + 8*(num_channels + num_tau + num_iid)
+//! 52  u32  header_len = 72 + 8*(num_channels + num_tau + num_iid + num_scales)
 //! 56  u32  mode (0 = mono, 1 = binaural)
 //! 60  u32  num_tau (ITD grid size; 0 for mono)
 //! 64  u32  num_iid (IID grid size; 0 for mono)
-//! 68  f64 × num_channels   channel center frequencies (gc_resp.fr1)
+//! 68  u32  value_kind (0 = dcGC amplitude, 1 = reassigned energy,
+//!                      2 = consensus salience)
+//! 72  f64 × num_channels   channel center frequencies (gc_resp.fr1)
 //! ..  f64 × num_tau        EI population ITD grid in seconds (binaural)
 //! ..  f64 × num_iid        EI population IID grid in dB (binaural)
+//! ..  f64 × num_scales     bandwidth-consensus scales (consensus salience)
 //! header_len..  sample-major f32 data:
-//!               mono:     per sample [dcgc num_ch]
-//!               binaural: per sample [dcgc_mean num_ch][iid num_ch]
-//!                         [itd num_ch][ei num_ch] — the mean of the two ears'
-//!                         dcGC amplitudes plus, per channel, the characteristic
-//!                         IID (dB) and ITD (seconds) of the lowest-activity EI
-//!                         unit plus that unit's activity
+//!               mono:     per sample [values num_ch]
+//!               binaural: per sample [values num_ch][iid num_ch]
+//!                         [itd num_ch][ei num_ch] — per channel the stored
+//!                         values plus the characteristic IID (dB) and ITD
+//!                         (seconds) of the lowest-activity EI unit plus that
+//!                         unit's activity
 //! ```
+//!
+//! The stored values depend on `value_kind`: dcGC amplitudes (mono) or the
+//! two-ear dcGC mean (binaural) for `0`; causally reassigned analytic energy
+//! for `1`; mask-gated rolling bandwidth-consensus salience (0 where the
+//! consensus mask rejects the bin) for `2`. Binaural reassigned/salience
+//! analyses run separate per-ear reassignment chains alongside the
+//! Breebaart hybrid and store the per-ear mean; the EI blocks are unchanged.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -40,7 +50,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytemuck::cast_slice;
-use gammachirp_rs::gcfb_v234::{ControlMode, DcgcEvent, DynHpaf, GcParam, GcfbStream};
+use gammachirp_rs::gcfb_v234::{
+    BandwidthConsensusStream, BandwidthConsensusStreamConfig, BandwidthConsensusStreamFrame,
+    ControlMode, DcgcEvent, DynHpaf, GcParam, GcfbStream, ReassignmentStream,
+    ReassignmentStreamStep, linear_weights, utils,
+};
 use gammachirp_rs::{
     breebaart2001::{
         EiConfig, EiIntegrationBoundary, EiStreamSample, EiUnit, HybridBinauralConfig,
@@ -49,17 +63,23 @@ use gammachirp_rs::{
     gcfb_v234::gcfb_v234::LvlEst,
 };
 use memmap2::Mmap;
+use ndarray::Array1;
 use rodio::{Decoder, Source};
 
 const MAGIC: &[u8; 4] = b"GCA1";
 const VERSION: u32 = 1;
 const ENGINE_GCFB_V234_SAMPLE: u32 = 1;
-const FIXED_HEADER_LEN: usize = 68;
+const FIXED_HEADER_LEN: usize = 72;
 const NUM_SAMPLES_OFFSET: u64 = 24;
 
 /// Numeric analysis-mode tags stored in the file header.
 pub const MODE_MONO: u32 = 0;
 pub const MODE_BINAURAL: u32 = 1;
+
+/// Numeric stored-value tags stored in the file header.
+pub const VALUE_AMPLITUDE: u32 = 0;
+pub const VALUE_REASSIGNED: u32 = 1;
+pub const VALUE_SALIENCE: u32 = 2;
 
 /// Errors returned by [`probe_audio`] and [`run_analysis`].
 #[derive(Debug)]
@@ -141,6 +161,55 @@ pub fn mode_label(tag: u32) -> &'static str {
         MODE_MONO => "Mono",
         MODE_BINAURAL => "Binaural",
         _ => "Unknown",
+    }
+}
+
+/// Human-readable label for a stored value-kind tag.
+pub fn value_kind_label(tag: u32) -> &'static str {
+    match tag {
+        VALUE_AMPLITUDE => "dcGC amplitude",
+        VALUE_REASSIGNED => "Reassigned energy",
+        VALUE_SALIENCE => "Consensus salience",
+        _ => "Unknown",
+    }
+}
+
+/// Which per-sample values an analysis stores.
+///
+/// [`AnalysisValues::Reassigned`] runs a causal [`ReassignmentStream`] and
+/// stores the deposited analytic energy. [`AnalysisValues::Consensus`] runs a
+/// rolling [`BandwidthConsensusStream`] and stores mask-gated consensus
+/// salience (0 where the consensus mask rejects the bin). Both work in mono
+/// and binaural mode; binaural analyses run one reassignment chain per ear
+/// alongside the Breebaart hybrid and store the per-ear mean.
+#[derive(Clone, Debug, Default)]
+pub enum AnalysisValues {
+    /// Ordinary dcGC amplitudes (mono) or the two-ear dcGC mean (binaural).
+    #[default]
+    Amplitude,
+    /// Causally reassigned analytic energy on the channel × sample grid.
+    Reassigned,
+    /// Mask-gated rolling bandwidth-consensus salience in `[0, 1]`.
+    Consensus(BandwidthConsensusStreamConfig),
+}
+
+impl AnalysisValues {
+    /// Numeric tag stored in the file header.
+    pub fn tag(&self) -> u32 {
+        match self {
+            AnalysisValues::Amplitude => VALUE_AMPLITUDE,
+            AnalysisValues::Reassigned => VALUE_REASSIGNED,
+            AnalysisValues::Consensus(_) => VALUE_SALIENCE,
+        }
+    }
+
+    /// Consensus bandwidth scales stored in the file header (empty unless
+    /// this is [`AnalysisValues::Consensus`]).
+    pub fn scales(&self) -> &[f64] {
+        match self {
+            AnalysisValues::Consensus(config) => &config.scales,
+            _ => &[],
+        }
     }
 }
 
@@ -229,6 +298,8 @@ pub struct BuilderParams {
     pub mode: AnalysisMode,
     /// Used only when `mode` is [`AnalysisMode::Binaural`].
     pub binaural: BinauralParams,
+    /// Which per-sample values the analysis stores.
+    pub values: AnalysisValues,
 }
 
 impl Default for BuilderParams {
@@ -251,6 +322,7 @@ impl Default for BuilderParams {
             },
             mode: AnalysisMode::Mono,
             binaural: BinauralParams::default(),
+            values: AnalysisValues::Amplitude,
         }
     }
 }
@@ -285,10 +357,15 @@ pub struct AnalysisHeader {
     pub control_mode: u32,
     /// See [`MODE_MONO`] / [`MODE_BINAURAL`].
     pub mode: u32,
+    /// See [`VALUE_AMPLITUDE`] / [`VALUE_REASSIGNED`] / [`VALUE_SALIENCE`].
+    pub value_kind: u32,
     /// ITD grid of the EI population in seconds (empty for mono).
     pub tau_seconds: Vec<f64>,
     /// IID grid of the EI population in dB (empty for mono).
     pub iid_db: Vec<f64>,
+    /// Bandwidth-consensus scales (empty unless `value_kind` is
+    /// [`VALUE_SALIENCE`]).
+    pub scales: Vec<f64>,
     /// Channel center frequencies in Hz (`num_channels` entries).
     pub channel_freqs: Vec<f64>,
 }
@@ -296,7 +373,10 @@ pub struct AnalysisHeader {
 impl AnalysisHeader {
     pub fn header_len(&self) -> usize {
         FIXED_HEADER_LEN
-            + 8 * (self.channel_freqs.len() + self.tau_seconds.len() + self.iid_db.len())
+            + 8 * (self.channel_freqs.len()
+                + self.tau_seconds.len()
+                + self.iid_db.len()
+                + self.scales.len())
     }
 
     pub fn duration(&self) -> f64 {
@@ -304,8 +384,8 @@ impl AnalysisHeader {
     }
 
     /// f32 values stored per sample: `num_ch` for mono, `4 * num_ch` for
-    /// binaural (the two-ear dcGC mean plus the lowest EI unit's IID, ITD,
-    /// and activity).
+    /// binaural (the stored values plus the lowest EI unit's IID, ITD, and
+    /// activity).
     pub fn values_per_sample(&self) -> usize {
         let num_ch = self.num_channels as usize;
         if self.mode == MODE_BINAURAL {
@@ -330,18 +410,23 @@ impl AnalysisHeader {
         bytes[56..60].copy_from_slice(&self.mode.to_le_bytes());
         bytes[60..64].copy_from_slice(&(self.tau_seconds.len() as u32).to_le_bytes());
         bytes[64..68].copy_from_slice(&(self.iid_db.len() as u32).to_le_bytes());
-        for (index, freq) in self.channel_freqs.iter().enumerate() {
-            let start = FIXED_HEADER_LEN + 8 * index;
-            bytes[start..start + 8].copy_from_slice(&freq.to_le_bytes());
+        bytes[68..72].copy_from_slice(&self.value_kind.to_le_bytes());
+        let mut offset = FIXED_HEADER_LEN;
+        for freq in &self.channel_freqs {
+            bytes[offset..offset + 8].copy_from_slice(&freq.to_le_bytes());
+            offset += 8;
         }
-        for (index, tau) in self.tau_seconds.iter().enumerate() {
-            let start = FIXED_HEADER_LEN + 8 * (self.channel_freqs.len() + index);
-            bytes[start..start + 8].copy_from_slice(&tau.to_le_bytes());
+        for tau in &self.tau_seconds {
+            bytes[offset..offset + 8].copy_from_slice(&tau.to_le_bytes());
+            offset += 8;
         }
-        for (index, iid) in self.iid_db.iter().enumerate() {
-            let start =
-                FIXED_HEADER_LEN + 8 * (self.channel_freqs.len() + self.tau_seconds.len() + index);
-            bytes[start..start + 8].copy_from_slice(&iid.to_le_bytes());
+        for iid in &self.iid_db {
+            bytes[offset..offset + 8].copy_from_slice(&iid.to_le_bytes());
+            offset += 8;
+        }
+        for scale in &self.scales {
+            bytes[offset..offset + 8].copy_from_slice(&scale.to_le_bytes());
+            offset += 8;
         }
         bytes
     }
@@ -374,6 +459,10 @@ impl AnalysisHeader {
         if mode != MODE_MONO && mode != MODE_BINAURAL {
             return Err(invalid(&format!("unknown analysis mode {mode}")));
         }
+        let value_kind = read_u32(68);
+        if value_kind > VALUE_SALIENCE {
+            return Err(invalid(&format!("unknown value kind {value_kind}")));
+        }
         let num_channels = read_u32(20);
         let num_tau = read_u32(60);
         let num_iid = read_u32(64);
@@ -381,8 +470,15 @@ impl AnalysisHeader {
             return Err(invalid("inconsistent mode / channel / EI unit counts"));
         }
         let header_len = read_u32(52) as usize;
-        if header_len != FIXED_HEADER_LEN + 8 * (num_channels + num_tau + num_iid) as usize {
+        let fixed_counts = (num_channels + num_tau + num_iid) as usize;
+        if header_len < FIXED_HEADER_LEN + 8 * fixed_counts
+            || !(header_len - FIXED_HEADER_LEN).is_multiple_of(8)
+        {
             return Err(invalid("inconsistent channel count / header length"));
+        }
+        let num_scales = (header_len - FIXED_HEADER_LEN) / 8 - fixed_counts;
+        if (value_kind == VALUE_SALIENCE) != (num_scales >= 2) {
+            return Err(invalid("inconsistent value kind / consensus scale count"));
         }
         if bytes.len() < header_len {
             return Err(invalid("file shorter than full header"));
@@ -403,6 +499,12 @@ impl AnalysisHeader {
                 FIXED_HEADER_LEN + 8 * (num_channels as usize + num_tau as usize + index),
             ));
         }
+        let mut scales = Vec::with_capacity(num_scales);
+        for index in 0..num_scales {
+            scales.push(read_f64(
+                FIXED_HEADER_LEN + 8 * (fixed_counts + index),
+            ));
+        }
         Ok(Self {
             sample_rate: read_f64(12),
             num_channels,
@@ -410,8 +512,10 @@ impl AnalysisHeader {
             f_range: [read_f64(32), read_f64(40)],
             control_mode: read_u32(48),
             mode,
+            value_kind,
             tau_seconds,
             iid_db,
+            scales,
             channel_freqs,
         })
     }
@@ -456,10 +560,55 @@ fn prepared_gc(gc: &GcParam, fs: f64) -> GcParam {
     }
 }
 
+/// Validate the consensus configuration before any file is created; the
+/// library checks the same rules, but failing early gives a clearer error.
+fn validate_consensus(config: &BandwidthConsensusStreamConfig) -> Result<(), AnalysisError> {
+    let scales = &config.scales;
+    let valid_ranges = config.relative_support_floor.is_finite()
+        && config.relative_support_floor > 0.0
+        && config.relative_support_floor < 1.0
+        && config.required_agreement.is_finite()
+        && config.required_agreement > 0.0
+        && config.required_agreement <= 1.0;
+    if scales.len() < 2 || !valid_ranges {
+        return Err(AnalysisError::Message(
+            "bandwidth consensus requires at least two scales, a support floor in (0, 1), \
+             and required agreement in (0, 1]"
+                .into(),
+        ));
+    }
+    if scales.iter().any(|scale| !scale.is_finite() || *scale <= 0.0) {
+        return Err(AnalysisError::Message(
+            "bandwidth consensus scales must be positive and finite".into(),
+        ));
+    }
+    for (index, scale) in scales.iter().enumerate() {
+        if scales[..index].contains(scale) {
+            return Err(AnalysisError::Message(
+                "bandwidth consensus scales must be unique".into(),
+            ));
+        }
+    }
+    if scales.iter().filter(|&&scale| scale == 1.0).count() != 1 {
+        return Err(AnalysisError::Message(
+            "bandwidth consensus requires exactly one 1.0 baseline scale".into(),
+        ));
+    }
+    if config.window_samples == Some(0) {
+        return Err(AnalysisError::Message(
+            "bandwidth consensus window must contain at least one sample".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Run an offline per-sample analysis of `input` and stream the result to
 /// `output`. In mono mode the input is downmixed and run through a single
 /// GCFB v2.34; in binaural mode a stereo input runs through the
 /// Breebaart-2001 / GCFB hybrid (per-ear GCFB plus an EI population).
+/// Depending on [`BuilderParams::values`] the stored rows are dcGC
+/// amplitudes, causally reassigned energy (one reassignment chain per ear),
+/// or mask-gated rolling bandwidth-consensus salience.
 ///
 /// Decoding, filtering, and writing are all chunked, so peak memory is
 /// independent of the input length. `progress` is called with the number of
@@ -472,9 +621,19 @@ pub fn run_analysis(
     mut progress: impl FnMut(u64),
     cancel: &AtomicBool,
 ) -> Result<AnalysisHeader, AnalysisError> {
-    let result = match params.mode {
-        AnalysisMode::Mono => run_mono_inner(input, output, params, &mut progress, cancel),
-        AnalysisMode::Binaural => run_binaural_inner(input, output, params, &mut progress, cancel),
+    let result = match (&params.mode, &params.values) {
+        (AnalysisMode::Mono, AnalysisValues::Amplitude) => {
+            run_mono_inner(input, output, params, &mut progress, cancel)
+        }
+        (AnalysisMode::Mono, values) => {
+            run_mono_reassigned_inner(input, output, params, values, &mut progress, cancel)
+        }
+        (AnalysisMode::Binaural, AnalysisValues::Amplitude) => {
+            run_binaural_inner(input, output, params, &mut progress, cancel)
+        }
+        (AnalysisMode::Binaural, values) => {
+            run_binaural_reassigned_inner(input, output, params, values, &mut progress, cancel)
+        }
     };
     if result.is_err() {
         // Never leave a partial or corrupt file behind.
@@ -503,8 +662,10 @@ fn run_mono_inner(
         f_range: params.gc.f_range,
         control_mode: control_mode_tag(params.gc.ctrl),
         mode: params.mode.tag(),
+        value_kind: VALUE_AMPLITUDE,
         tau_seconds: Vec::new(),
         iid_db: Vec::new(),
+        scales: Vec::new(),
         channel_freqs: stream.gc_resp().fr1.to_vec(),
     };
 
@@ -597,6 +758,368 @@ fn process_chunk(
             _ => write_buf.extend(step.scgc_smpl.iter().map(|&v| v as f32)),
         }
         *num_samples += 1;
+    }
+    writer.write_all(cast_slice(write_buf))?;
+    progress(*num_samples);
+    Ok(())
+}
+
+/// Ring buffer of reassigned energy on the channel × sample grid. Column `c`
+/// lives at slot `c % capacity`; once the causal atoms can no longer deposit
+/// into it (later deposits always target later columns) it is final, and
+/// `take_column` returns and clears it.
+struct RollingEnergyMap {
+    energy: ndarray::Array2<f64>,
+}
+
+impl RollingEnergyMap {
+    fn new(channels: usize, capacity: usize) -> Self {
+        Self {
+            energy: ndarray::Array2::zeros((channels, capacity)),
+        }
+    }
+
+    fn add(
+        &mut self,
+        channel: usize,
+        target_sample: usize,
+        energy: f64,
+    ) -> Result<(), AnalysisError> {
+        if !energy.is_finite() || energy < 0.0 {
+            return Err(AnalysisError::Message(
+                "non-finite or negative reassigned energy".into(),
+            ));
+        }
+        if energy == 0.0 {
+            return Ok(());
+        }
+        let slot = target_sample % self.energy.ncols();
+        let value = self.energy[[channel, slot]] + energy;
+        if !value.is_finite() {
+            return Err(AnalysisError::Message(
+                "reassigned energy overflowed".into(),
+            ));
+        }
+        self.energy[[channel, slot]] = value;
+        Ok(())
+    }
+
+    fn take_column(&mut self, target_sample: usize) -> Array1<f64> {
+        let slot = target_sample % self.energy.ncols();
+        let mut column = self.energy.column_mut(slot);
+        let owned = column.to_owned();
+        column.fill(0.0);
+        owned
+    }
+}
+
+/// One reassignment processing chain: either a single causal
+/// [`ReassignmentStream`] with a rolling target map, or a rolling
+/// [`BandwidthConsensusStream`]. Yields finalized per-sample columns
+/// (reassigned energy, or mask-gated consensus salience) in sample order.
+enum Chain {
+    Reassign {
+        stream: Box<ReassignmentStream>,
+        map: RollingEnergyMap,
+        erb_axis: Vec<f64>,
+        window: usize,
+        next_output: usize,
+    },
+    Consensus(Box<BandwidthConsensusStream>),
+}
+
+impl Chain {
+    fn new(gc: GcParam, values: &AnalysisValues) -> Result<Self, AnalysisError> {
+        match values {
+            AnalysisValues::Amplitude => Err(AnalysisError::Message(
+                "amplitude analyses do not use a reassignment chain".into(),
+            )),
+            AnalysisValues::Reassigned => {
+                let stream = ReassignmentStream::new(gc).map_err(message)?;
+                // A column is final once one full atom history has passed:
+                // the causal atoms only ever deposit at or before the current
+                // input sample. One lookahead slot covers interpolation.
+                let window = stream.max_buffered_samples();
+                let channels = stream.gc_param().num_ch;
+                let (erb_axis, _) = utils::freq2erb(stream.gc_resp().fr1.as_slice().unwrap());
+                Ok(Self::Reassign {
+                    stream: Box::new(stream),
+                    map: RollingEnergyMap::new(channels, window + 1),
+                    erb_axis: erb_axis.to_vec(),
+                    window,
+                    next_output: 0,
+                })
+            }
+            AnalysisValues::Consensus(config) => {
+                validate_consensus(config)?;
+                let stream =
+                    BandwidthConsensusStream::new(gc, config.clone()).map_err(message)?;
+                Ok(Self::Consensus(Box::new(stream)))
+            }
+        }
+    }
+
+    /// Channel center frequencies in Hz of the shared target grid.
+    fn channel_freqs_hz(&self) -> Vec<f64> {
+        match self {
+            Chain::Reassign { stream, .. } => stream.gc_resp().fr1.to_vec(),
+            Chain::Consensus(stream) => stream.gc_resp().fr1.to_vec(),
+        }
+    }
+
+    /// Feed one input sample; returns the column finalized by it, if any.
+    fn process_sample(&mut self, sample: f64) -> Result<Option<Array1<f64>>, AnalysisError> {
+        match self {
+            Chain::Reassign {
+                stream,
+                map,
+                erb_axis,
+                window,
+                next_output,
+            } => {
+                let step = stream.process_sample(sample).map_err(message)?;
+                let sample_index = step.filterbank.sample_index;
+                let fs = stream.gc_param().fs;
+                deposit_step(map, &step, fs, *next_output, sample_index, erb_axis)?;
+                if sample_index >= *window {
+                    let column = map.take_column(*next_output);
+                    *next_output += 1;
+                    Ok(Some(column))
+                } else {
+                    Ok(None)
+                }
+            }
+            Chain::Consensus(stream) => {
+                let step = stream.process_sample(sample).map_err(message)?;
+                Ok(step.consensus.map(|frame| gated_salience(&frame)))
+            }
+        }
+    }
+
+    /// Flush the columns still held by the rolling window at end of input.
+    fn finish(self) -> Result<Vec<Array1<f64>>, AnalysisError> {
+        match self {
+            Chain::Reassign {
+                stream,
+                mut map,
+                next_output,
+                ..
+            } => {
+                let samples = stream.samples_processed();
+                Ok((next_output..samples)
+                    .map(|target| map.take_column(target))
+                    .collect())
+            }
+            Chain::Consensus(stream) => {
+                let frames = stream.finish().map_err(message)?;
+                Ok(frames.iter().map(gated_salience).collect())
+            }
+        }
+    }
+}
+
+/// Consensus salience with rejected bins floored to zero, matching the
+/// example's rendering: bins failing the required agreement carry no
+/// salience.
+fn gated_salience(frame: &BandwidthConsensusStreamFrame) -> Array1<f64> {
+    Array1::from_iter(frame.salience.iter().zip(&frame.consensus_mask).map(
+        |(&salience, &accepted)| if accepted { salience } else { 0.0 },
+    ))
+}
+
+/// Deposit one causal reassignment step into the rolling target map with
+/// linear time and frequency (ERB) interpolation, mirroring the library's
+/// rolling-consensus deposition. Contributions outside the live window are
+/// dropped.
+fn deposit_step(
+    map: &mut RollingEnergyMap,
+    step: &ReassignmentStreamStep,
+    sample_rate: f64,
+    live_start: usize,
+    live_end: usize,
+    erb_axis: &[f64],
+) -> Result<(), AnalysisError> {
+    for ch in 0..step.source_energy.len() {
+        let energy = step.source_energy[ch];
+        if !energy.is_finite() || energy < 0.0 {
+            return Err(AnalysisError::Message(
+                "non-finite causal energy during reassignment".into(),
+            ));
+        }
+        if energy == 0.0 || !step.coordinate_mask[ch] || step.f_hat[ch] <= 0.0 {
+            continue;
+        }
+        let Some(time_weights) = time_weights(step.t_hat[ch], sample_rate, live_start, live_end)
+        else {
+            continue;
+        };
+        let (frequency_erb, _) = utils::freq2erb(&[step.f_hat[ch]]);
+        let Some(frequency_weights) = linear_weights(erb_axis, frequency_erb[0]) else {
+            continue;
+        };
+        for (target_sample, time_weight) in time_weights {
+            for &(target_channel, frequency_weight) in &frequency_weights {
+                map.add(
+                    target_channel,
+                    target_sample,
+                    energy * time_weight * frequency_weight,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Linear time-interpolation weights of `time_seconds` within
+/// `[live_start, live_end]` samples.
+fn time_weights(
+    time_seconds: f64,
+    sample_rate: f64,
+    live_start: usize,
+    live_end: usize,
+) -> Option<[(usize, f64); 2]> {
+    let sample = time_seconds * sample_rate;
+    if !sample.is_finite() || sample < live_start as f64 || sample > live_end as f64 {
+        return None;
+    }
+    let lower = sample.floor() as usize;
+    if lower == live_end || sample == lower as f64 {
+        return Some([(lower, 1.0), (lower, 0.0)]);
+    }
+    let upper = lower.checked_add(1)?;
+    if upper > live_end {
+        return None;
+    }
+    let upper_weight = sample - lower as f64;
+    Some([(lower, 1.0 - upper_weight), (upper, upper_weight)])
+}
+
+/// Mono reassigned/salience analysis: like [`run_mono_inner`], but rows come
+/// from a reassignment chain and are written as they are finalized (the
+/// chain adds a fixed rolling-window latency, flushed at end of input).
+fn run_mono_reassigned_inner(
+    input: &Path,
+    output: &Path,
+    params: &BuilderParams,
+    values: &AnalysisValues,
+    progress: &mut impl FnMut(u64),
+    cancel: &AtomicBool,
+) -> Result<AnalysisHeader, AnalysisError> {
+    let probe = probe_audio(input)?;
+    let fs = probe.sample_rate as f64;
+    validate_gc(&params.gc, fs)?;
+
+    let mut chain = Chain::new(prepared_gc(&params.gc, fs), values)?;
+
+    let header = AnalysisHeader {
+        sample_rate: fs,
+        num_channels: params.gc.num_ch as u32,
+        num_samples: 0, // patched at the end
+        f_range: params.gc.f_range,
+        control_mode: control_mode_tag(params.gc.ctrl),
+        mode: params.mode.tag(),
+        value_kind: values.tag(),
+        tau_seconds: Vec::new(),
+        iid_db: Vec::new(),
+        scales: values.scales().to_vec(),
+        channel_freqs: chain.channel_freqs_hz(),
+    };
+
+    let file = File::create(output)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&header.encode())?;
+
+    let decoder = streaming_decoder(input)?;
+    let channels = probe.channels.max(1) as usize;
+    let chunk_len = (probe.sample_rate as usize / 4).max(1); // ~0.25 s of mono audio
+    let num_ch = params.gc.num_ch;
+
+    let mut mono_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
+    let mut mix_acc = 0.0_f64;
+    let mut mix_count = 0_usize;
+    let mut write_buf: Vec<f32> = Vec::with_capacity(chunk_len * num_ch);
+    let mut num_samples = 0_u64;
+    let mut input_samples = 0_u64;
+
+    for sample in decoder {
+        mix_acc += f64::from(sample);
+        mix_count += 1;
+        if mix_count == channels {
+            mono_chunk.push(mix_acc / channels as f64);
+            mix_acc = 0.0;
+            mix_count = 0;
+        }
+        if mono_chunk.len() == chunk_len {
+            process_chain_chunk(
+                &mut chain,
+                &mono_chunk,
+                &mut write_buf,
+                &mut writer,
+                &mut num_samples,
+                progress,
+                cancel,
+            )?;
+            input_samples += mono_chunk.len() as u64;
+            mono_chunk.clear();
+        }
+    }
+    if !mono_chunk.is_empty() {
+        process_chain_chunk(
+            &mut chain,
+            &mono_chunk,
+            &mut write_buf,
+            &mut writer,
+            &mut num_samples,
+            progress,
+            cancel,
+        )?;
+        input_samples += mono_chunk.len() as u64;
+    }
+    if input_samples == 0 {
+        return Err(AnalysisError::Message(
+            "no decodable audio samples in input file".into(),
+        ));
+    }
+    // Flush the columns still held by the rolling window.
+    write_buf.clear();
+    for column in chain.finish()? {
+        write_buf.extend(column.iter().map(|&v| v as f32));
+        num_samples += 1;
+    }
+    writer.write_all(cast_slice(&write_buf))?;
+    if num_samples != input_samples {
+        return Err(AnalysisError::Message(format!(
+            "reassignment finalized {num_samples} of {input_samples} input samples"
+        )));
+    }
+
+    finalize(writer, num_samples)?;
+    progress(num_samples);
+    Ok(AnalysisHeader {
+        num_samples,
+        ..header
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_chain_chunk(
+    chain: &mut Chain,
+    mono: &[f64],
+    write_buf: &mut Vec<f32>,
+    writer: &mut BufWriter<File>,
+    num_samples: &mut u64,
+    progress: &mut impl FnMut(u64),
+    cancel: &AtomicBool,
+) -> Result<(), AnalysisError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AnalysisError::Cancelled);
+    }
+    write_buf.clear();
+    for &sample in mono {
+        if let Some(column) = chain.process_sample(sample)? {
+            write_buf.extend(column.iter().map(|&v| v as f32));
+            *num_samples += 1;
+        }
     }
     writer.write_all(cast_slice(write_buf))?;
     progress(*num_samples);
@@ -746,8 +1269,10 @@ fn run_binaural_inner(
         f_range: params.gc.f_range,
         control_mode: control_mode_tag(params.gc.ctrl),
         mode: params.mode.tag(),
+        value_kind: VALUE_AMPLITUDE,
         tau_seconds: bin.tau_grid(),
         iid_db: bin.iid_grid(),
+        scales: Vec::new(),
         channel_freqs: stream.center_frequencies_hz().to_vec(),
     };
 
@@ -845,6 +1370,306 @@ fn process_binaural_chunk(
     Ok(())
 }
 
+/// Per-channel characteristic IID (dB), ITD (seconds), and activity of the
+/// lowest-activity EI unit for one sample. The EI stage integrates (L − R)²,
+/// so the unit tuned to the stimulus cancels it: per channel, the
+/// lowest-activity unit carries the characteristic IID and ITD (as in the
+/// breebaart2001_hybrid example).
+struct EiBlocks {
+    sample_index: u64,
+    iid: Vec<f32>,
+    itd: Vec<f32>,
+    ei: Vec<f32>,
+}
+
+fn ei_blocks(event: &EiStreamSample, units: &[EiUnit]) -> EiBlocks {
+    let num_ch = event.activity.ncols();
+    let mut iid = vec![0.0; num_ch];
+    let mut itd = vec![0.0; num_ch];
+    let mut ei = vec![0.0; num_ch];
+    for ch in 0..num_ch {
+        let (lowest, &activity) = event
+            .activity
+            .column(ch)
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .expect("EI population is never empty");
+        let unit = units[lowest];
+        iid[ch] = unit.iid_db as f32;
+        itd[ch] = unit.delay_seconds as f32;
+        ei[ch] = activity as f32;
+    }
+    EiBlocks {
+        sample_index: event.sample_index as u64,
+        iid,
+        itd,
+        ei,
+    }
+}
+
+/// Binaural reassignment assembly: EI blocks arrive from the hybrid stream
+/// in sample order; reassigned (or salience) columns arrive from the two
+/// per-ear chains in column order. Both queues are joined front-to-front, so
+/// each emitted row is `[values mean | iid | itd | ei]` for one sample.
+struct BinauralReassignedState {
+    pending_ei: VecDeque<EiBlocks>,
+    pending_values: VecDeque<Vec<f32>>,
+    write_buf: Vec<f32>,
+    num_samples: u64,
+}
+
+impl BinauralReassignedState {
+    fn new(chunk_len: usize, num_ch: usize) -> Self {
+        Self {
+            pending_ei: VecDeque::new(),
+            pending_values: VecDeque::new(),
+            write_buf: Vec::with_capacity(chunk_len * 4 * num_ch),
+            num_samples: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        step: HybridBinauralStreamStep,
+        left_column: Option<Array1<f64>>,
+        right_column: Option<Array1<f64>>,
+        units: &[EiUnit],
+    ) -> Result<(), AnalysisError> {
+        match (left_column, right_column) {
+            (Some(left), Some(right)) => {
+                self.pending_values.push_back(mean_f32(&left, &right));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(AnalysisError::Message(
+                    "per-ear reassignment chains lost column alignment".into(),
+                ));
+            }
+        }
+        if let Some(event) = step.ei_event {
+            self.pending_ei.push_back(ei_blocks(&event, units));
+        }
+        self.emit_ready()
+    }
+
+    fn emit_ready(&mut self) -> Result<(), AnalysisError> {
+        while !self.pending_ei.is_empty() && !self.pending_values.is_empty() {
+            let ei = self.pending_ei.pop_front().unwrap();
+            let values = self.pending_values.pop_front().unwrap();
+            if ei.sample_index != self.num_samples {
+                return Err(AnalysisError::Message(format!(
+                    "EI event for sample {} arrived while emitting sample {}",
+                    ei.sample_index, self.num_samples
+                )));
+            }
+            self.write_buf.extend_from_slice(&values);
+            self.write_buf.extend_from_slice(&ei.iid);
+            self.write_buf.extend_from_slice(&ei.itd);
+            self.write_buf.extend_from_slice(&ei.ei);
+            self.num_samples += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Per-ear mean of two finalized reassignment/salience columns.
+fn mean_f32(left: &Array1<f64>, right: &Array1<f64>) -> Vec<f32> {
+    left.iter()
+        .zip(right)
+        .map(|(&l, &r)| ((l + r) / 2.0) as f32)
+        .collect()
+}
+
+/// Binaural reassigned/salience analysis: the stereo input runs through the
+/// Breebaart hybrid (for the EI blocks) plus one reassignment chain per ear;
+/// the stored first block is the per-ear mean of the finalized columns.
+fn run_binaural_reassigned_inner(
+    input: &Path,
+    output: &Path,
+    params: &BuilderParams,
+    values: &AnalysisValues,
+    progress: &mut impl FnMut(u64),
+    cancel: &AtomicBool,
+) -> Result<AnalysisHeader, AnalysisError> {
+    let probe = probe_audio(input)?;
+    if probe.channels != 2 {
+        return Err(AnalysisError::Message(format!(
+            "binaural analysis requires a stereo input file (found {} channels)",
+            probe.channels
+        )));
+    }
+    let fs = probe.sample_rate as f64;
+    validate_gc(&params.gc, fs)?;
+    let bin = &params.binaural;
+    if !(bin.tau_max_seconds.is_finite() && bin.tau_max_seconds > 0.0) {
+        return Err(AnalysisError::Message(format!(
+            "ITD range must be positive and finite (got {:.2e} s)",
+            bin.tau_max_seconds
+        )));
+    }
+    if bin.num_tau == 0 || bin.num_iid == 0 {
+        return Err(AnalysisError::Message(
+            "EI population must contain at least one unit per dimension".into(),
+        ));
+    }
+    if !(bin.iid_max_db.is_finite() && bin.iid_max_db > 0.0) {
+        return Err(AnalysisError::Message(format!(
+            "IID range must be positive and finite (got {:.2e} dB)",
+            bin.iid_max_db
+        )));
+    }
+    let units = bin.units();
+
+    let config = HybridBinauralConfig {
+        filterbank: prepared_gc(&params.gc, fs),
+        peripheral: bin.peripheral.clone(),
+        ei: EiConfig {
+            // The streaming EI stage requires causal integration; the
+            // population limit follows the configured ITD range.
+            integration_boundary: EiIntegrationBoundary::CausalZeroState,
+            max_abs_delay_seconds: bin.tau_max_seconds,
+            ..bin.ei.clone()
+        },
+    };
+    let mut stream = HybridBinauralStream::new(&units, config).map_err(message)?;
+    let gc = prepared_gc(&params.gc, fs);
+    let mut left_chain = Chain::new(gc.clone(), values)?;
+    let mut right_chain = Chain::new(gc, values)?;
+
+    let num_ch = params.gc.num_ch;
+    let header = AnalysisHeader {
+        sample_rate: fs,
+        num_channels: num_ch as u32,
+        num_samples: 0, // patched at the end
+        f_range: params.gc.f_range,
+        control_mode: control_mode_tag(params.gc.ctrl),
+        mode: params.mode.tag(),
+        value_kind: values.tag(),
+        tau_seconds: bin.tau_grid(),
+        iid_db: bin.iid_grid(),
+        scales: values.scales().to_vec(),
+        channel_freqs: stream.center_frequencies_hz().to_vec(),
+    };
+
+    let file = File::create(output)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&header.encode())?;
+
+    let decoder = streaming_decoder(input)?;
+    let chunk_len = (probe.sample_rate as usize / 4).max(1); // ~0.25 s of audio
+    let mut state = BinauralReassignedState::new(chunk_len, num_ch);
+
+    let mut left_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
+    let mut right_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
+    let mut is_left = true;
+    for sample in decoder {
+        if is_left {
+            left_chunk.push(f64::from(sample));
+        } else {
+            right_chunk.push(f64::from(sample));
+        }
+        is_left = !is_left;
+        if left_chunk.len() == chunk_len && right_chunk.len() == chunk_len {
+            process_binaural_reassigned_chunk(
+                &mut stream,
+                &mut left_chain,
+                &mut right_chain,
+                &mut state,
+                &units,
+                &left_chunk,
+                &right_chunk,
+                &mut writer,
+                progress,
+                cancel,
+            )?;
+            left_chunk.clear();
+            right_chunk.clear();
+        }
+    }
+    // A trailing unpaired sample (odd-length stereo) is dropped.
+    let tail_len = left_chunk.len().min(right_chunk.len());
+    if tail_len > 0 {
+        process_binaural_reassigned_chunk(
+            &mut stream,
+            &mut left_chain,
+            &mut right_chain,
+            &mut state,
+            &units,
+            &left_chunk[..tail_len],
+            &right_chunk[..tail_len],
+            &mut writer,
+            progress,
+            cancel,
+        )?;
+    }
+    if stream.samples_processed() == 0 {
+        return Err(AnalysisError::Message(
+            "no decodable audio samples in input file".into(),
+        ));
+    }
+    // Flush the EI latency tail and the chains' rolling windows.
+    state.write_buf.clear();
+    for event in stream.finish().map_err(message)? {
+        state.pending_ei.push_back(ei_blocks(&event, &units));
+    }
+    let left_tail = left_chain.finish()?;
+    let right_tail = right_chain.finish()?;
+    if left_tail.len() != right_tail.len() {
+        return Err(AnalysisError::Message(
+            "per-ear reassignment chains finalized different sample counts".into(),
+        ));
+    }
+    for (left, right) in left_tail.iter().zip(&right_tail) {
+        state.pending_values.push_back(mean_f32(left, right));
+    }
+    state.emit_ready()?;
+    writer.write_all(cast_slice(&state.write_buf))?;
+    if !state.pending_ei.is_empty() || !state.pending_values.is_empty() {
+        return Err(AnalysisError::Message(format!(
+            "EI stage and reassignment chains emitted mismatched sample counts \
+             ({} and {} left over)",
+            state.pending_ei.len(),
+            state.pending_values.len()
+        )));
+    }
+
+    finalize(writer, state.num_samples)?;
+    progress(state.num_samples);
+    Ok(AnalysisHeader {
+        num_samples: state.num_samples,
+        ..header
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_binaural_reassigned_chunk(
+    stream: &mut HybridBinauralStream,
+    left_chain: &mut Chain,
+    right_chain: &mut Chain,
+    state: &mut BinauralReassignedState,
+    units: &[EiUnit],
+    left: &[f64],
+    right: &[f64],
+    writer: &mut BufWriter<File>,
+    progress: &mut impl FnMut(u64),
+    cancel: &AtomicBool,
+) -> Result<(), AnalysisError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AnalysisError::Cancelled);
+    }
+    state.write_buf.clear();
+    for (&l, &r) in left.iter().zip(right) {
+        let step = stream.process_sample(l, r).map_err(message)?;
+        let left_column = left_chain.process_sample(l)?;
+        let right_column = right_chain.process_sample(r)?;
+        state.push(step, left_column, right_column, units)?;
+    }
+    writer.write_all(cast_slice(&state.write_buf))?;
+    progress(state.num_samples);
+    Ok(())
+}
+
 /// Patch the sample count into the header and sync the file to disk.
 fn finalize(mut writer: BufWriter<File>, num_samples: u64) -> Result<(), AnalysisError> {
     writer.flush()?;
@@ -874,19 +1699,21 @@ impl AnalysisReader {
                 AnalysisError::Message("invalid analysis file: truncated header".into())
             })?;
         }
-        // Decode needs the full header; read channel frequencies and the EI
-        // population grids too. The magic must be checked first: a non-.gca
-        // file would otherwise yield a garbage (possibly huge) channel count.
+        // Decode needs the full header. Its length is stored in the file
+        // (the consensus-scale count is not in the fixed header); the magic
+        // must be checked first, and the stored length is capped by the file
+        // size so a corrupt file cannot trigger a huge read.
         if &fixed[0..4] != MAGIC {
             return Err(AnalysisError::Message(
                 "invalid analysis file: bad magic (not a .gca file)".into(),
             ));
         }
-        let num_channels = u32::from_le_bytes(fixed[20..24].try_into().unwrap_or([0; 4])) as usize;
-        let num_tau = u32::from_le_bytes(fixed[60..64].try_into().unwrap_or([0; 4])) as usize;
-        let num_iid = u32::from_le_bytes(fixed[64..68].try_into().unwrap_or([0; 4])) as usize;
-        let header_len = FIXED_HEADER_LEN + 8 * (num_channels + num_tau + num_iid);
-        if file_len < header_len {
+        let header_len =
+            u32::from_le_bytes(fixed[52..56].try_into().unwrap_or([0; 4])) as usize;
+        if header_len < FIXED_HEADER_LEN
+            || header_len > file_len
+            || !(header_len - FIXED_HEADER_LEN).is_multiple_of(8)
+        {
             return Err(AnalysisError::Message(
                 "invalid analysis file: truncated header".into(),
             ));
@@ -1042,8 +1869,10 @@ mod tests {
             f_range: [40.0, 16_000.0],
             control_mode: 1,
             mode: MODE_MONO,
+            value_kind: VALUE_AMPLITUDE,
             tau_seconds: Vec::new(),
             iid_db: Vec::new(),
+            scales: Vec::new(),
             channel_freqs: vec![40.0, 1000.0, 16_000.0],
         };
         assert_eq!(AnalysisHeader::decode(&mono.encode()).unwrap(), mono);
@@ -1057,6 +1886,22 @@ mod tests {
         let decoded = AnalysisHeader::decode(&binaural.encode()).unwrap();
         assert_eq!(decoded, binaural);
         assert_eq!(decoded.values_per_sample(), 4 * 3);
+
+        let salience = AnalysisHeader {
+            value_kind: VALUE_SALIENCE,
+            scales: vec![0.8, 1.0, 1.2],
+            ..mono.clone()
+        };
+        assert_eq!(AnalysisHeader::decode(&salience.encode()).unwrap(), salience);
+
+        let reassigned = AnalysisHeader {
+            value_kind: VALUE_REASSIGNED,
+            ..mono.clone()
+        };
+        assert_eq!(
+            AnalysisHeader::decode(&reassigned.encode()).unwrap(),
+            reassigned
+        );
     }
 
     #[test]
@@ -1069,8 +1914,10 @@ mod tests {
             f_range: [40.0, 16_000.0],
             control_mode: 0,
             mode: MODE_MONO,
+            value_kind: VALUE_AMPLITUDE,
             tau_seconds: Vec::new(),
             iid_db: Vec::new(),
+            scales: Vec::new(),
             channel_freqs: vec![100.0, 200.0],
         };
         let mut bytes = mono.encode();
@@ -1082,6 +1929,24 @@ mod tests {
         assert!(AnalysisHeader::decode(&bytes).is_err());
         let mut bytes = mono.encode();
         bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(AnalysisHeader::decode(&bytes).is_err());
+        // An unknown value kind is rejected.
+        let mut bytes = mono.encode();
+        bytes[68..72].copy_from_slice(&3_u32.to_le_bytes());
+        assert!(AnalysisHeader::decode(&bytes).is_err());
+        // Consensus salience requires at least two scales; other value kinds
+        // require none.
+        let mut bytes = mono.encode();
+        bytes[68..72].copy_from_slice(&VALUE_SALIENCE.to_le_bytes());
+        assert!(AnalysisHeader::decode(&bytes).is_err());
+        let with_scales = AnalysisHeader {
+            value_kind: VALUE_SALIENCE,
+            scales: vec![0.8, 1.0],
+            ..mono.clone()
+        };
+        AnalysisHeader::decode(&with_scales.encode()).unwrap();
+        let mut bytes = with_scales.encode();
+        bytes[68..72].copy_from_slice(&VALUE_REASSIGNED.to_le_bytes());
         assert!(AnalysisHeader::decode(&bytes).is_err());
     }
 
@@ -1213,6 +2078,7 @@ mod tests {
                 ..BuilderParams::default().gc
             },
             mode: AnalysisMode::Binaural,
+            values: AnalysisValues::Amplitude,
             binaural: BinauralParams {
                 tau_max_seconds: 1e-3,
                 num_tau: 9,
@@ -1520,6 +2386,230 @@ mod tests {
 
         let reader = AnalysisReader::open(&gca).unwrap();
         assert_eq!(reader.data().len(), expected_samples as usize * 4 * 100);
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Reassigned mono analyses store causally reassigned energy; the peak
+    /// channel must still sit near the 1 kHz tone.
+    #[test]
+    fn end_to_end_mono_reassigned() {
+        let (wav, gca) = temp_paths("reassign");
+        let expected_samples = write_test_wav(&wav);
+
+        let params = BuilderParams {
+            gc: GcParam {
+                num_ch: 32,
+                f_range: [40.0, 16_000.0],
+                ..BuilderParams::default().gc
+            },
+            values: AnalysisValues::Reassigned,
+            ..BuilderParams::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, expected_samples);
+        assert_eq!(header.value_kind, VALUE_REASSIGNED);
+        assert!(header.scales.is_empty());
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert_eq!(reader.header, header);
+        assert!(!reader.is_binaural());
+        assert_eq!(reader.data().len(), expected_samples as usize * 32);
+        assert!(reader.data().iter().all(|&value| value >= 0.0));
+
+        // Total reassigned energy per channel; the strongest channel must
+        // sit near 1 kHz.
+        let mut energy = [0.0_f32; 32];
+        for row in reader.data().chunks_exact(32) {
+            for (sum, &value) in energy.iter_mut().zip(row.iter()) {
+                *sum += value;
+            }
+        }
+        let (best, _) = energy
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let best_freq = reader.header.channel_freqs[best];
+        assert!(
+            (600.0..=1700.0).contains(&best_freq),
+            "peak channel {best} at {best_freq:.0} Hz, expected near 1000 Hz"
+        );
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Consensus mono analyses store mask-gated salience in [0, 1] plus the
+    /// bandwidth scales in the header. Uses a short 16 kHz tone: rolling
+    /// consensus runs one full chain per bandwidth scale.
+    #[test]
+    fn end_to_end_mono_salience() {
+        use gammachirp_rs::gcfb_v234::GainReference;
+
+        let (wav, gca) = temp_paths("salience");
+        let sample_rate = 16_000_u32;
+        let num_samples = sample_rate as usize / 10;
+        let mut data = Vec::with_capacity(num_samples * 2);
+        for n in 0..num_samples {
+            let t = n as f64 / f64::from(sample_rate);
+            let value = (0.5 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() * 32_767.0) as i16;
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        write_wav(&wav, sample_rate, 1, &data);
+
+        let params = BuilderParams {
+            gc: GcParam {
+                num_ch: 16,
+                f_range: [180.0, 3_000.0],
+                ctrl: ControlMode::Static,
+                gain_ref: GainReference::Db(50.0),
+                ..BuilderParams::default().gc
+            },
+            values: AnalysisValues::Consensus(BandwidthConsensusStreamConfig::default()),
+            ..BuilderParams::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, num_samples as u64);
+        assert_eq!(header.value_kind, VALUE_SALIENCE);
+        assert_eq!(header.scales, vec![0.8, 1.0, 1.2]);
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert_eq!(reader.header, header);
+        assert_eq!(reader.data().len(), num_samples * 16);
+        assert!(
+            reader
+                .data()
+                .iter()
+                .all(|&value| (0.0..=1.0).contains(&value))
+        );
+        // A steady 1 kHz tone must earn consensus support somewhere.
+        assert!(reader.data().iter().any(|&value| value > 0.0));
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Binaural reassignment runs separate per-ear chains alongside the
+    /// hybrid: the first block holds the per-ear mean reassigned energy, the
+    /// EI blocks are unchanged.
+    #[test]
+    fn binaural_reassigned_end_to_end() {
+        let (wav, gca) = temp_paths("bin_reassign");
+        let delay_samples = 22_usize; // ≈ 0.499 ms at 44.1 kHz
+        let expected_samples = write_binaural_wav(&wav, delay_samples, 1.0);
+
+        let params = BuilderParams {
+            values: AnalysisValues::Reassigned,
+            ..binaural_test_params()
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, expected_samples);
+        assert_eq!(header.mode, MODE_BINAURAL);
+        assert_eq!(header.value_kind, VALUE_REASSIGNED);
+        assert_eq!(header.values_per_sample(), 4 * 32);
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert!(reader.is_binaural());
+        assert_eq!(reader.header, header);
+        assert_eq!(reader.data().len(), expected_samples as usize * 4 * 32);
+        assert!(reader.dcgc_row(0).iter().all(|&value| value >= 0.0));
+
+        let num_ch = 32_usize;
+        let mut peaks = vec![0.0_f32; num_ch];
+        let mut iid_sums = vec![0.0_f32; num_ch];
+        let mut itd_sums = vec![0.0_f32; num_ch];
+        reader.aggregate_binaural_column(
+            0,
+            header.num_samples,
+            &mut peaks,
+            &mut iid_sums,
+            &mut itd_sums,
+        );
+        assert!(peaks.iter().any(|&p| p > 0.0));
+
+        // The EI path is unaffected by reassignment: the right-ear delay
+        // still shows up as the characteristic ITD (τ = −d paper-symmetric).
+        let channel = channel_near(&header, 500.0);
+        let itd = itd_sums[channel] as f64 / header.num_samples as f64;
+        let expected_itd = -(delay_samples as f64 / 44_100.0);
+        assert!(
+            (itd - expected_itd).abs() <= 0.26e-3,
+            "dominant ITD {itd:.6} s, expected near {expected_itd:.6} s"
+        );
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Binaural consensus salience: same layout, but the first block holds
+    /// the per-ear mean mask-gated salience. Uses a short 16 kHz stereo tone
+    /// (rolling consensus runs one full chain per ear per scale).
+    #[test]
+    fn binaural_salience_end_to_end() {
+        let (wav, gca) = temp_paths("bin_salience");
+        let sample_rate = 16_000_u32;
+        let num_samples = sample_rate as usize / 10;
+        let mut data = Vec::with_capacity(num_samples * 4);
+        for n in 0..num_samples {
+            let t = n as f64 / f64::from(sample_rate);
+            let value = (0.5 * (2.0 * std::f64::consts::PI * 500.0 * t).sin() * 32_767.0) as i16;
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        write_wav(&wav, sample_rate, 2, &data);
+
+        let params = BuilderParams {
+            gc: GcParam {
+                num_ch: 16,
+                f_range: [180.0, 3_000.0],
+                ..binaural_test_params().gc
+            },
+            values: AnalysisValues::Consensus(BandwidthConsensusStreamConfig::default()),
+            ..binaural_test_params()
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, num_samples as u64);
+        assert_eq!(header.value_kind, VALUE_SALIENCE);
+        assert_eq!(header.scales, vec![0.8, 1.0, 1.2]);
+        assert_eq!(header.values_per_sample(), 4 * 16);
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert_eq!(reader.header, header);
+        assert_eq!(reader.data().len(), num_samples * 4 * 16);
+        for sample in [0, num_samples as u64 / 2, num_samples as u64 - 1] {
+            let salience = reader.dcgc_row(sample);
+            assert!(salience.iter().all(|&value| (0.0..=1.0).contains(&value)));
+        }
+        assert!(
+            reader
+                .data()
+                .chunks_exact(4 * 16)
+                .any(|row| row[..16].iter().any(|&v| v > 0.0))
+        );
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Invalid consensus configurations are rejected before any file is
+    /// created.
+    #[test]
+    fn rejects_invalid_consensus_config() {
+        let (wav, gca) = temp_paths("bad_consensus");
+        write_test_wav(&wav);
+        let cancel = AtomicBool::new(false);
+        for scales in [vec![1.0], vec![0.8, 1.2], vec![0.8, 1.0, 1.0]] {
+            let params = BuilderParams {
+                gc: GcParam {
+                    num_ch: 8,
+                    ..BuilderParams::default().gc
+                },
+                values: AnalysisValues::Consensus(BandwidthConsensusStreamConfig {
+                    scales,
+                    ..BandwidthConsensusStreamConfig::default()
+                }),
+                ..BuilderParams::default()
+            };
+            let result = run_analysis(&wav, &gca, &params, |_| {}, &cancel);
+            assert!(matches!(result, Err(AnalysisError::Message(_))));
+            assert!(!gca.exists());
+        }
         let _ = fs::remove_dir_all(wav.parent().unwrap());
     }
 }

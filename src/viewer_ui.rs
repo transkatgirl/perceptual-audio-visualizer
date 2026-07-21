@@ -9,8 +9,20 @@ use eframe::egui;
 use rodio::{DeviceSinkBuilder, Player};
 
 use crate::analysis::{
-    AnalysisReader, control_mode_label, mode_label, probe_audio, streaming_decoder,
+    AnalysisReader, VALUE_AMPLITUDE, VALUE_SALIENCE, control_mode_label, mode_label, probe_audio,
+    streaming_decoder, value_kind_label,
 };
+
+/// Displayed dB for one stored value: reassigned energy and consensus
+/// salience are power-like quantities (10·log10), dcGC amplitude is an
+/// amplitude (20·log10).
+fn value_db(value_kind: u32, value: f32) -> f32 {
+    if value_kind == VALUE_AMPLITUDE {
+        20.0 * (value.abs() + 1e-12).log10()
+    } else {
+        10.0 * (value.abs() + 1e-12).log10()
+    }
+}
 
 /// Spectrogram texture width in columns; the visible window is always exactly
 /// this many columns wide, so zoom level maps to samples-per-column.
@@ -176,16 +188,26 @@ impl ViewerTab {
 
         let header = &loaded.reader.header;
         let mut info = format!(
-            "{:.0} Hz · {} ch · {:.0}–{:.0} Hz · {} · {} · {} ({})",
+            "{:.0} Hz · {} ch · {:.0}–{:.0} Hz · {} · {} · {} · {} ({})",
             header.sample_rate,
             header.num_channels,
             header.f_range[0],
             header.f_range[1],
             mode_label(header.mode),
             control_mode_label(header.control_mode),
+            value_kind_label(header.value_kind),
             fmt_time(header.duration()),
             crate::builder_ui::human_bytes(header.num_samples * header.values_per_sample() as u64 * 4),
         );
+        if header.value_kind == VALUE_SALIENCE {
+            let scales = header
+                .scales
+                .iter()
+                .map(|scale| format!("{scale:.1}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            info = format!("{info} · scales [{scales}]");
+        }
         if loaded.reader.is_binaural() {
             let tau_max_ms = header
                 .tau_seconds
@@ -450,15 +472,20 @@ impl ViewerTab {
             let ch = (num_ch as f32 * (1.0 - ch_frac)) as usize;
             let ch = ch.min(num_ch - 1);
             let sample = (time * fs).clamp(0.0, (loaded.reader.header.num_samples - 1) as f64);
+            let value_label = match loaded.reader.header.value_kind {
+                VALUE_SALIENCE => "salience dB",
+                VALUE_AMPLITUDE => "dB",
+                _ => "energy dB",
+            };
             if loaded.reader.is_binaural() {
                 let sample = sample as u64;
                 let amp = loaded.reader.dcgc_row(sample)[ch].abs();
-                let db = 20.0 * (amp + 1e-12).log10();
+                let db = value_db(loaded.reader.header.value_kind, amp);
                 let iid_db = loaded.reader.iid_row(sample)[ch];
                 let itd_ms = loaded.reader.itd_row(sample)[ch] * 1e3;
                 let ei_mu = loaded.reader.ei_row(sample)[ch];
                 response.clone().on_hover_text(format!(
-                    "{} · {:.0} Hz (ch {}) · {:.1} dB · {iid_db:+.1} dB IID · {itd_ms:.2} ms ITD · {ei_mu:.3} MU EI",
+                    "{} · {:.0} Hz (ch {}) · {:.1} {value_label} · {iid_db:+.1} dB IID · {itd_ms:.2} ms ITD · {ei_mu:.3} MU EI",
                     fmt_time(time),
                     loaded.reader.header.channel_freqs[ch],
                     ch,
@@ -466,9 +493,9 @@ impl ViewerTab {
                 ));
             } else {
                 let value = loaded.reader.row(sample as u64)[ch];
-                let db = 20.0 * (value.abs() + 1e-12).log10();
+                let db = value_db(loaded.reader.header.value_kind, value);
                 response.clone().on_hover_text(format!(
-                    "{} · {:.0} Hz (ch {}) · {:.1} dB",
+                    "{} · {:.0} Hz (ch {}) · {:.1} {value_label}",
                     fmt_time(time),
                     loaded.reader.header.channel_freqs[ch],
                     ch,
@@ -757,6 +784,7 @@ impl Spectrogram {
             .max(a + 1)
             .min(num_samples);
         let span = (ceil_db - floor_db).max(1e-6);
+        let value_kind = reader.header.value_kind;
         if self.binaural {
             reader.aggregate_binaural_column(
                 a,
@@ -767,7 +795,7 @@ impl Spectrogram {
             );
             let count = (b - a) as f32;
             for ch in 0..self.num_ch {
-                let db = 20.0 * (self.peaks[ch] + 1e-12).log10();
+                let db = value_db(value_kind, self.peaks[ch]);
                 let t = ((db - floor_db) / span).clamp(0.0, 1.0);
                 // The stored values are the characteristic IID/ITD of each
                 // sample's lowest-activity EI unit; use the column mean.
@@ -792,7 +820,7 @@ impl Spectrogram {
         }
         reader.column_peaks(a, b, &mut self.peaks);
         for ch in 0..self.num_ch {
-            let db = 20.0 * (self.peaks[ch] + 1e-12).log10();
+            let db = value_db(value_kind, self.peaks[ch]);
             let t = ((db - floor_db) / span).clamp(0.0, 1.0);
             let color = self.lut[(t * 255.0) as usize];
             // Row 0 is the top of the image; put low frequencies at the bottom.
@@ -834,7 +862,7 @@ fn auto_ceiling(reader: &AnalysisReader, view_start: f64, view_span: f64) -> f32
             }
         }
     }
-    (20.0 * (max + 1e-12).log10()).ceil()
+    value_db(reader.header.value_kind, max).ceil()
 }
 
 /// Approximate matplotlib "magma" via anchor-point interpolation.
