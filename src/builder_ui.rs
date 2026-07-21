@@ -80,7 +80,10 @@ fn parse_scales(text: &str) -> Result<Vec<f64>, String> {
     if scales.len() < 2 {
         return Err("at least two scales are required".into());
     }
-    if scales.iter().any(|scale| !scale.is_finite() || *scale <= 0.0) {
+    if scales
+        .iter()
+        .any(|scale| !scale.is_finite() || *scale <= 0.0)
+    {
         return Err("scales must be positive and finite".into());
     }
     for (index, scale) in scales.iter().enumerate() {
@@ -268,7 +271,11 @@ impl BuilderTab {
         if let AnalysisValues::Consensus(config) = &mut params.values {
             config.window_samples = if self.window_override {
                 // The probe is guaranteed by validation_error in this state.
-                let fs = self.probe.as_ref().map(|probe| probe.sample_rate).unwrap_or(1);
+                let fs = self
+                    .probe
+                    .as_ref()
+                    .map(|probe| probe.sample_rate)
+                    .unwrap_or(1);
                 Some(((self.window_ms * 1e-3 * f64::from(fs)).round() as usize).max(1))
             } else {
                 None // library-derived: the longest causal atom
@@ -351,10 +358,7 @@ impl BuilderTab {
                 .selected_text(stored_values_name(current))
                 .show_ui(ui, |ui| {
                     for (label, stored) in STORED_VALUES {
-                        if ui
-                            .selectable_label(current == stored, label)
-                            .clicked()
-                        {
+                        if ui.selectable_label(current == stored, label).clicked() {
                             self.set_stored_values(stored);
                         }
                     }
@@ -384,7 +388,7 @@ impl BuilderTab {
                             .speed(10.0),
                     );
                     ui.label("Channels");
-                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=512));
+                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=4096));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Control");
@@ -700,9 +704,7 @@ impl BuilderTab {
                             }
                             ui.end_row();
                             for tc in per.adaptation_time_constants_seconds.iter_mut() {
-                                ui.add(
-                                    egui::DragValue::new(tc).range(0.001..=2.0).speed(0.001),
-                                );
+                                ui.add(egui::DragValue::new(tc).range(0.001..=2.0).speed(0.001));
                             }
                             ui.end_row();
                         });
@@ -749,9 +751,7 @@ impl BuilderTab {
                             );
                         }
                         ui.label("Noise seed");
-                        ui.add(egui::DragValue::new(
-                            &mut per.absolute_threshold_noise_seed,
-                        ));
+                        ui.add(egui::DragValue::new(&mut per.absolute_threshold_noise_seed));
                     });
                 });
         }
@@ -802,11 +802,14 @@ impl BuilderTab {
                          fraction of its rolling maximum",
                     );
                     ui.label("Required agreement");
-                    ui.add(egui::Slider::new(&mut config.required_agreement, 0.05..=1.0))
-                        .on_hover_text(
-                            "Minimum fraction of scales that must support a bin; salience \
+                    ui.add(egui::Slider::new(
+                        &mut config.required_agreement,
+                        0.05..=1.0,
+                    ))
+                    .on_hover_text(
+                        "Minimum fraction of scales that must support a bin; salience \
                              is the corresponding order statistic of the normalized maps",
-                        );
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(window_override, "Override rolling window");
@@ -838,9 +841,7 @@ impl BuilderTab {
         ui.heading("Analysis builder");
         ui.add_space(4.0);
         let mode_blurb = match self.params.mode {
-            AnalysisMode::Mono => {
-                "decoded, downmixed to mono, and streamed through the filterbank"
-            }
+            AnalysisMode::Mono => "decoded, downmixed to mono, and streamed through the filterbank",
             AnalysisMode::Binaural => {
                 "decoded as stereo and streamed through per-ear filterbanks plus a \
                  Breebaart-2001 EI population"
@@ -870,10 +871,7 @@ impl BuilderTab {
             if self.input != prev_input {
                 // New audio: re-probe and re-derive the output path.
                 self.probe = None;
-                self.output = self
-                    .input
-                    .as_ref()
-                    .map(|input| input.with_extension("gca"));
+                self.output = self.input.as_ref().map(|input| input.with_extension("gca"));
             }
             if ui
                 .button("Probe / re-read file info")
