@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui;
-use rodio::{DeviceSinkBuilder, Player, cpal::BufferSize};
+use rodio::{DeviceSinkBuilder, Player};
 
 use crate::analysis::{
     AnalysisReader, VALUE_AMPLITUDE, VALUE_SALIENCE, control_mode_label, mode_label, probe_audio,
@@ -52,7 +52,7 @@ struct Loaded {
 }
 
 struct Playback {
-    handle: rodio::MixerDeviceSink,
+    _handle: rodio::MixerDeviceSink,
     player: Player,
 }
 
@@ -273,7 +273,6 @@ impl ViewerTab {
 
         let playing = is_playing(loaded);
         let pos = position(loaded);
-        let pos_compensated = position_latency_compensated(loaded);
 
         // Transport bar.
         let mut seek_request: Option<f64> = None;
@@ -324,7 +323,7 @@ impl ViewerTab {
 
         // Follow the playhead during playback (continuous scroll).
         if playing && *follow {
-            *view_start = (pos_compensated - *view_span * 0.7).max(0.0);
+            *view_start = (pos - *view_span * 0.3).max(0.0);
         }
         clamp_view(loaded, view_start, view_span);
 
@@ -433,7 +432,7 @@ impl ViewerTab {
         }
 
         // Playhead.
-        let p_now = pos_compensated * TEX_W as f64 / *view_span;
+        let p_now = pos * TEX_W as f64 / *view_span;
         let playhead_x = rect.left() + ((p_now - p_view_f) as f32) * col_w;
         if playhead_x >= rect.left() && playhead_x <= rect.right() {
             painter.line_segment(
@@ -613,25 +612,6 @@ fn position(loaded: &Loaded) -> f64 {
     }
 }
 
-fn position_latency_compensated(loaded: &Loaded) -> f64 {
-    match &loaded.playback {
-        Some(playback) if !playback.player.empty() => (playback.player.get_pos().as_secs_f64()
-            + if playback.player.is_paused() {
-                0.0
-            } else {
-                match playback.handle.config().buffer_size() {
-                    BufferSize::Fixed(size) => {
-                        *size as f64 / u32::from(playback.handle.config().sample_rate()) as f64
-                    }
-                    BufferSize::Default => panic!(),
-                }
-            })
-        .clamp(0.0, loaded.duration),
-        Some(_) => loaded.duration, // finished
-        None => 0.0,
-    }
-}
-
 fn is_playing(loaded: &Loaded) -> bool {
     loaded
         .playback
@@ -660,7 +640,10 @@ impl Playback {
         let decoder = streaming_decoder(path).map_err(|e| e.to_string())?;
         player.append(decoder);
         player.pause();
-        Ok(Self { handle, player })
+        Ok(Self {
+            _handle: handle,
+            player,
+        })
     }
 
     fn restart(&mut self, path: &Path, status: &mut String) {
