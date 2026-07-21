@@ -68,7 +68,7 @@ impl Default for ViewerTab {
             view_start: 0.0,
             view_span: 5.0,
             floor_db: -100.0,
-            ceil_db: -60.0,
+            ceil_db: -55.0,
         }
     }
 }
@@ -532,7 +532,7 @@ impl ViewerTab {
                 .changed();
             if ui.button("Auto range").clicked() {
                 *ceil_db = auto_ceiling(&loaded.reader, *view_start, *view_span);
-                *floor_db = (*ceil_db - 40.0).max(-140.0);
+                *floor_db = (*ceil_db - 45.0).max(-140.0);
                 loaded.spec.invalidate();
             }
             if floor_changed || ceil_changed {
