@@ -388,7 +388,7 @@ impl BuilderTab {
                             .speed(10.0),
                     );
                     ui.label("Channels");
-                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=4096));
+                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=1536));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Control");
