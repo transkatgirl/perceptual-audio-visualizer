@@ -26,7 +26,7 @@ fn value_db(value_kind: u32, value: f32) -> f32 {
 
 /// Spectrogram texture width in columns; the visible window is always exactly
 /// this many columns wide, so zoom level maps to samples-per-column.
-const TEX_W: usize = 2048;
+const TEX_W: usize = 4096;
 const MIN_SPAN: f64 = 0.05;
 const MAX_SPAN: f64 = 20.0;
 
