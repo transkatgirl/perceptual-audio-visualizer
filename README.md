@@ -74,6 +74,13 @@ analysis as sample-major `f32` rows:
 A time window is therefore one contiguous byte range in either mode, which is
 what makes cheap memory-mapped viewing possible.
 
+The sample count is patched into the header only when a run finishes. A file
+whose header still says `0` samples but has data appended — an analysis that
+is still being written, or one terminated early by a crash or kill — opens as
+an *incomplete* analysis: the viewer recovers the sample count from the file
+size (ignoring a partially written tail row) and shows what exists so far;
+press *Load* again to refresh.
+
 ## Development
 
 ```bash

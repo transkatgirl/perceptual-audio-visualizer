@@ -84,8 +84,9 @@ impl ViewerTab {
         else {
             return;
         };
+        self.set_status(String::new(), false);
         match self.load_inner(ctx, &audio, &analysis) {
-            Ok(()) => self.set_status(String::new(), false),
+            Ok(()) => {}
             Err(error) => {
                 self.loaded = None;
                 self.set_status(error, true);
@@ -119,6 +120,7 @@ impl ViewerTab {
             }
         };
         let duration = reader.header.duration();
+        let complete = reader.is_complete();
         self.view_start = 0.0;
         self.view_span = duration.clamp(MIN_SPAN, MAX_SPAN.min(duration.max(MIN_SPAN)));
         self.ceil_db = auto_ceiling(&reader, self.view_start, self.view_span);
@@ -130,6 +132,16 @@ impl ViewerTab {
             playback,
             duration,
         });
+        if !complete && !self.status_is_error {
+            self.set_status(
+                format!(
+                    "incomplete analysis (still processing or terminated early) — \
+                     showing the first {}; press Load to refresh",
+                    fmt_time(duration)
+                ),
+                false,
+            );
+        }
         Ok(())
     }
 
@@ -228,6 +240,9 @@ impl ViewerTab {
                 header.tau_seconds.len(),
                 header.iid_db.len(),
             );
+        }
+        if !loaded.reader.is_complete() {
+            info = format!("{info} · INCOMPLETE");
         }
         ui.label(info);
         ui.add_space(4.0);

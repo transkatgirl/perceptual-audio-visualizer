@@ -10,7 +10,9 @@
 //! 8   u32  engine = 1  (1 = gcfb_v234 per-sample)
 //! 12  f64  sample_rate
 //! 20  u32  num_channels
-//! 24  u64  num_samples           (patched in at end of write)
+//! 24  u64  num_samples           (patched in at end of write; 0 with data
+//!                                 present = incomplete analysis, see
+//!                                 [`AnalysisReader::open`])
 //! 32  f64  f_range_low
 //! 40  f64  f_range_high
 //! 48  u32  control_mode (0=Static, 1=Dynamic, 2=Level)
@@ -1685,6 +1687,7 @@ fn finalize(mut writer: BufWriter<File>, num_samples: u64) -> Result<(), Analysi
 pub struct AnalysisReader {
     pub header: AnalysisHeader,
     mmap: Mmap,
+    complete: bool,
 }
 
 impl AnalysisReader {
@@ -1731,15 +1734,35 @@ impl AnalysisReader {
                     AnalysisError::Message("invalid analysis file: truncated header".into())
                 })?;
         }
-        let header = AnalysisHeader::decode(&header_bytes)?;
-        let expected = header_len + header.num_samples as usize * header.values_per_sample() * 4;
+        let mut header = AnalysisHeader::decode(&header_bytes)?;
+        let row_bytes = header.values_per_sample() * 4;
+        let expected = header_len + header.num_samples as usize * row_bytes;
         if file_len < expected {
             return Err(AnalysisError::Message(format!(
                 "invalid analysis file: expected at least {expected} bytes, found {file_len}"
             )));
         }
+        // A run that is still in progress or was terminated early (crash or
+        // kill) never patched the sample count into the header. Recover the
+        // count from the file size, flooring to whole rows so a partially
+        // flushed tail row is ignored. A successful run always has
+        // num_samples > 0, so 0 with data present unambiguously means
+        // incomplete.
+        let mut complete = true;
+        if header.num_samples == 0 && file_len > header_len {
+            header.num_samples = ((file_len - header_len) / row_bytes) as u64;
+            complete = false;
+        }
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { header, mmap })
+        Ok(Self { header, mmap, complete })
+    }
+
+    /// False if the file was opened before its sample count was finalized
+    /// (analysis still running or terminated early); the recovered
+    /// [`AnalysisHeader::num_samples`] then reflects only the data on disk
+    /// at open time.
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// True for a binaural (dcGC mean + EI population) analysis.
@@ -2131,6 +2154,7 @@ mod tests {
 
         let reader = AnalysisReader::open(&gca).unwrap();
         assert_eq!(reader.header, header);
+        assert!(reader.is_complete());
         assert!(!reader.is_binaural());
         assert_eq!(reader.data().len(), expected_samples as usize * 32);
         assert_eq!(reader.row(0).len(), 32);
@@ -2165,6 +2189,91 @@ mod tests {
         let result = run_analysis(&wav, &gca, &BuilderParams::default(), |_| {}, &cancel);
         assert!(matches!(result, Err(AnalysisError::Cancelled)));
         assert!(!gca.exists());
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// Craft an incomplete `.gca` from a completed one: the header with the
+    /// sample count zeroed (as it is until [`finalize`]) plus `rows` whole
+    /// data rows and `extra` stray trailing bytes (a partially flushed row).
+    fn write_incomplete_gca(complete: &Path, out: &Path, rows: u64, extra: usize) {
+        let bytes = fs::read(complete).unwrap();
+        let reader = AnalysisReader::open(complete).unwrap();
+        let header_len = reader.header.header_len();
+        let row_bytes = reader.header.values_per_sample() * 4;
+        let mut partial = bytes[..header_len].to_vec();
+        let count_range = NUM_SAMPLES_OFFSET as usize..NUM_SAMPLES_OFFSET as usize + 8;
+        partial[count_range].copy_from_slice(&0_u64.to_le_bytes());
+        let data_end = header_len + rows as usize * row_bytes;
+        partial.extend_from_slice(&bytes[header_len..data_end]);
+        partial.extend_from_slice(&[0xAB_u8; 8][..extra]);
+        fs::write(out, &partial).unwrap();
+    }
+
+    fn incomplete_test_params() -> BuilderParams {
+        BuilderParams {
+            gc: GcParam {
+                num_ch: 32,
+                f_range: [40.0, 16_000.0],
+                ..BuilderParams::default().gc
+            },
+            ..BuilderParams::default()
+        }
+    }
+
+    #[test]
+    fn incomplete_analysis_recovers_rows_from_file_size() {
+        let (wav, gca) = temp_paths("incomplete");
+        write_test_wav(&wav);
+        let cancel = AtomicBool::new(false);
+        run_analysis(&wav, &gca, &incomplete_test_params(), |_| {}, &cancel).unwrap();
+
+        let partial = gca.with_file_name("partial.gca");
+        write_incomplete_gca(&gca, &partial, 1000, 0);
+
+        let complete_reader = AnalysisReader::open(&gca).unwrap();
+        assert!(complete_reader.is_complete());
+        let reader = AnalysisReader::open(&partial).unwrap();
+        assert!(!reader.is_complete());
+        assert_eq!(reader.header.num_samples, 1000);
+        // Recovered rows are byte-identical to the complete analysis.
+        assert_eq!(reader.row(999), complete_reader.row(999));
+        assert_eq!(reader.rows(10, 20), complete_reader.rows(10, 20));
+        assert_eq!(reader.data().len(), 1000 * 32);
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    #[test]
+    fn incomplete_analysis_ignores_trailing_partial_row() {
+        let (wav, gca) = temp_paths("partial_row");
+        write_test_wav(&wav);
+        let cancel = AtomicBool::new(false);
+        run_analysis(&wav, &gca, &incomplete_test_params(), |_| {}, &cancel).unwrap();
+
+        let partial = gca.with_file_name("partial.gca");
+        write_incomplete_gca(&gca, &partial, 500, 7);
+
+        let reader = AnalysisReader::open(&partial).unwrap();
+        assert!(!reader.is_complete());
+        assert_eq!(reader.header.num_samples, 500);
+        assert_eq!(reader.data().len(), 500 * 32);
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    #[test]
+    fn unfinalized_analysis_without_data_opens_complete() {
+        // num_samples == 0 with no appended data: a degenerate empty file,
+        // opened as complete (pre-existing behavior).
+        let (wav, gca) = temp_paths("unfinalized_empty");
+        write_test_wav(&wav);
+        let cancel = AtomicBool::new(false);
+        run_analysis(&wav, &gca, &incomplete_test_params(), |_| {}, &cancel).unwrap();
+
+        let partial = gca.with_file_name("partial.gca");
+        write_incomplete_gca(&gca, &partial, 0, 0);
+
+        let reader = AnalysisReader::open(&partial).unwrap();
+        assert!(reader.is_complete());
+        assert_eq!(reader.header.num_samples, 0);
         let _ = fs::remove_dir_all(wav.parent().unwrap());
     }
 
