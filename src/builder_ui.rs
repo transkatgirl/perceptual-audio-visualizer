@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gammachirp_rs::breebaart2001::EiDelayConvention;
@@ -122,6 +122,7 @@ enum BuilderMsg {
 struct RunningState {
     cancel: Arc<AtomicBool>,
     rx: Receiver<BuilderMsg>,
+    started: Instant,
 }
 
 pub struct BuilderTab {
@@ -295,7 +296,11 @@ impl BuilderTab {
         });
         self.done_samples = 0;
         self.set_status("analysis running…", false);
-        self.running = Some(RunningState { cancel, rx });
+        self.running = Some(RunningState {
+            cancel,
+            rx,
+            started: Instant::now(),
+        });
     }
 
     fn poll(&mut self) {
@@ -860,7 +865,16 @@ impl BuilderTab {
 
         let enabled = !running;
         ui.add_enabled_ui(enabled, |ui| {
+            let prev_input = self.input.clone();
             file_row(ui, "Audio input", &mut self.input, false);
+            if self.input != prev_input {
+                // New audio: re-probe and re-derive the output path.
+                self.probe = None;
+                self.output = self
+                    .input
+                    .as_ref()
+                    .map(|input| input.with_extension("gca"));
+            }
             if ui
                 .button("Probe / re-read file info")
                 .on_hover_text(
@@ -965,6 +979,19 @@ impl BuilderTab {
                     .text(format!("{} samples", self.done_samples)),
             };
             ui.add(bar.desired_width(ui.available_width() * 0.6));
+            if let (Some(state), Some(total)) = (&self.running, total)
+                && total > 0
+                && self.done_samples > 0
+            {
+                let elapsed = state.started.elapsed().as_secs_f64();
+                let rate = self.done_samples as f64 / elapsed.max(1e-9);
+                let remaining = total.saturating_sub(self.done_samples) as f64 / rate;
+                ui.label(format!(
+                    "elapsed {} · ETA {}",
+                    fmt_duration(elapsed),
+                    fmt_duration(remaining)
+                ));
+            }
         }
 
         if !self.status.is_empty() {
@@ -1069,6 +1096,16 @@ fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, save: bo
             }
         }
     });
+}
+
+fn fmt_duration(secs: f64) -> String {
+    let secs = secs.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 pub fn human_bytes(bytes: u64) -> String {

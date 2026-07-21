@@ -67,8 +67,8 @@ impl Default for ViewerTab {
             follow: true,
             view_start: 0.0,
             view_span: 5.0,
-            floor_db: -60.0,
-            ceil_db: 0.0,
+            floor_db: -100.0,
+            ceil_db: -60.0,
         }
     }
 }
@@ -138,17 +138,10 @@ impl ViewerTab {
         ui.add_space(4.0);
 
         let mut do_load = false;
-        ui.horizontal(|ui| {
+        let prev_audio = self.audio_path.clone();
+        ui.horizontal_wrapped(|ui| {
             file_row(ui, "Audio", &mut self.audio_path, false);
             file_row(ui, "Analysis (.gca)", &mut self.analysis_path, true);
-            if self.analysis_path.is_none()
-                && let Some(audio) = &self.audio_path
-            {
-                let sibling = audio.with_extension("gca");
-                if sibling.exists() {
-                    self.analysis_path = Some(sibling);
-                }
-            }
             if ui
                 .add_enabled(
                     self.audio_path.is_some() && self.analysis_path.is_some(),
@@ -159,6 +152,13 @@ impl ViewerTab {
                 do_load = true;
             }
         });
+        if self.audio_path != prev_audio {
+            // New audio: point the analysis path at its sibling .gca.
+            self.analysis_path = self.audio_path.as_ref().and_then(|audio| {
+                let sibling = audio.with_extension("gca");
+                sibling.exists().then_some(sibling)
+            });
+        }
         if do_load {
             self.load(ui.ctx());
         }
@@ -197,7 +197,9 @@ impl ViewerTab {
             control_mode_label(header.control_mode),
             value_kind_label(header.value_kind),
             fmt_time(header.duration()),
-            crate::builder_ui::human_bytes(header.num_samples * header.values_per_sample() as u64 * 4),
+            crate::builder_ui::human_bytes(
+                header.num_samples * header.values_per_sample() as u64 * 4
+            ),
         );
         if header.value_kind == VALUE_SALIENCE {
             let scales = header
@@ -717,8 +719,16 @@ impl Spectrogram {
             tau_max,
             iid_max,
             stereo_var: StereoVar::default(),
-            iid_sums: if binaural { vec![0.0; num_ch] } else { Vec::new() },
-            itd_sums: if binaural { vec![0.0; num_ch] } else { Vec::new() },
+            iid_sums: if binaural {
+                vec![0.0; num_ch]
+            } else {
+                Vec::new()
+            },
+            itd_sums: if binaural {
+                vec![0.0; num_ch]
+            } else {
+                Vec::new()
+            },
             lut2d: if binaural {
                 crate::colormap::bivariate_lut()
             } else {
@@ -911,24 +921,11 @@ pub fn fmt_time(secs: f64) -> String {
     let secs = secs.max(0.0);
     let minutes = (secs / 60.0).floor();
     let rest = secs - minutes * 60.0;
-    format!("{minutes:02.0}:{rest:04.1}")
+    format!("{minutes:02.0}:{rest:06.3}")
 }
 
 fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, analysis: bool) {
     ui.label(label);
-    let text = path
-        .as_ref()
-        .map(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.display().to_string())
-        })
-        .unwrap_or_else(|| "(none)".into());
-    ui.monospace(text).on_hover_text(
-        path.as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
-    );
     if ui.button("Browse…").clicked() {
         let mut dialog = rfd::FileDialog::new();
         dialog = if analysis {
@@ -940,4 +937,18 @@ fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, analysis
             *path = Some(picked);
         }
     }
+    let text = path
+        .as_ref()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .unwrap_or_else(|| "(none)".into());
+    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap())
+        .on_hover_text(
+            path.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
 }
