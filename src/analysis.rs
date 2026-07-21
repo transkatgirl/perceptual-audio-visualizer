@@ -308,7 +308,7 @@ impl Default for BuilderParams {
     fn default() -> Self {
         Self {
             gc: GcParam {
-                num_ch: 300,
+                num_ch: 350,
                 f_range: [40.0, 16_000.0],
                 out_mid_crct: "ELC".into(),
                 ctrl: ControlMode::Dynamic,
