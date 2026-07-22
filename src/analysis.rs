@@ -247,8 +247,14 @@ impl Default for BinauralParams {
             num_tau: 9,
             iid_max_db: 5.0,
             num_iid: 19,
-            peripheral: PeripheralConfig::default(),
-            ei: EiConfig::streaming(),
+            peripheral: PeripheralConfig {
+                absolute_threshold_noise_level_db_spl: None,
+                ..Default::default()
+            },
+            ei: EiConfig {
+                internal_noise_std_mu: 0.0,
+                ..EiConfig::streaming()
+            },
         }
     }
 }
