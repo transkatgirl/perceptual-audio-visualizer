@@ -323,7 +323,7 @@ impl ViewerTab {
 
         // Follow the playhead during playback (continuous scroll).
         if playing && *follow {
-            *view_start = (pos - *view_span * 0.7).max(0.0);
+            *view_start = (pos - *view_span * 0.9).max(0.0);
         }
         clamp_view(loaded, view_start, view_span);
 
