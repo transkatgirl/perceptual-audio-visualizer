@@ -675,10 +675,10 @@ struct Spectrogram {
     next_p: u64,
     filled: u64,
     dirty: bool,
-    peaks: Vec<f32>,
+    sums: Vec<f32>,
     lut: Vec<egui::Color32>,
     /// Binaural rendering state; `iid_sums`, `itd_sums`, and `lut2d` stay
-    /// empty for mono analyses, and `peaks` doubles as the dcGC peaks buffer.
+    /// empty for mono analyses, and `sums` doubles as the dcGC sums buffer.
     binaural: bool,
     tau_max: f32,
     iid_max: f32,
@@ -728,7 +728,7 @@ impl Spectrogram {
             next_p: 0,
             filled: 0,
             dirty: false,
-            peaks: vec![0.0; num_ch],
+            sums: vec![0.0; num_ch],
             lut: magma_lut(),
             binaural,
             tau_max,
@@ -814,13 +814,14 @@ impl Spectrogram {
             reader.aggregate_binaural_column(
                 a,
                 b,
-                &mut self.peaks,
+                &mut self.sums,
                 &mut self.iid_sums,
                 &mut self.itd_sums,
             );
             let count = (b - a) as f32;
             for ch in 0..self.num_ch {
-                let db = value_db(value_kind, self.peaks[ch]);
+                // Lightness is the column mean of the stored dcGC mean.
+                let db = value_db(value_kind, self.sums[ch] / count);
                 let t = ((db - floor_db) / span).clamp(0.0, 1.0);
                 // The stored values are the characteristic IID/ITD of each
                 // sample's lowest-activity EI unit; use the column mean.
@@ -843,9 +844,9 @@ impl Spectrogram {
             self.dirty = true;
             return;
         }
-        reader.column_peaks(a, b, &mut self.peaks);
+        reader.column_means(a, b, &mut self.sums);
         for ch in 0..self.num_ch {
-            let db = value_db(value_kind, self.peaks[ch]);
+            let db = value_db(value_kind, self.sums[ch]);
             let t = ((db - floor_db) / span).clamp(0.0, 1.0);
             let color = self.lut[(t * 255.0) as usize];
             // Row 0 is the top of the image; put low frequencies at the bottom.
@@ -862,18 +863,19 @@ fn auto_ceiling(reader: &AnalysisReader, view_start: f64, view_span: f64) -> f32
     let p0 = (view_start * TEX_W as f64 / view_span).max(0.0) as u64;
     let mut max = 0.0_f32;
     let num_ch = reader.header.num_channels as usize;
-    let mut peaks = vec![0.0_f32; num_ch];
+    let mut means = vec![0.0_f32; num_ch];
     if reader.is_binaural() {
-        // Ceiling from the peaks of the stored two-ear dcGC mean.
+        // Ceiling from the column means of the stored two-ear dcGC mean.
         let mut iid_sums = vec![0.0_f32; num_ch];
         let mut itd_sums = vec![0.0_f32; num_ch];
         for i in 0..64_u64 {
             let p = p0 + i * (TEX_W as u64 / 64);
             let a = (p as f64 * spp) as u64;
             let b = (((p + 1) as f64 * spp) as u64).max(a + 1);
-            reader.aggregate_binaural_column(a, b, &mut peaks, &mut iid_sums, &mut itd_sums);
-            for &v in &peaks {
-                max = max.max(v);
+            reader.aggregate_binaural_column(a, b, &mut means, &mut iid_sums, &mut itd_sums);
+            let count = (b - a) as f32;
+            for &v in &means {
+                max = max.max(v / count);
             }
         }
     } else {
@@ -881,8 +883,8 @@ fn auto_ceiling(reader: &AnalysisReader, view_start: f64, view_span: f64) -> f32
             let p = p0 + i * (TEX_W as u64 / 64);
             let a = (p as f64 * spp) as u64;
             let b = (((p + 1) as f64 * spp) as u64).max(a + 1);
-            reader.column_peaks(a, b, &mut peaks);
-            for &v in &peaks {
+            reader.column_means(a, b, &mut means);
+            for &v in &means {
                 max = max.max(v);
             }
         }

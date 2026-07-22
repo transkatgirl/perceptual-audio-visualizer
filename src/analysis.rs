@@ -1800,14 +1800,21 @@ impl AnalysisReader {
         self.rows(sample, sample + 1)
     }
 
-    /// Per-channel peak absolute amplitude over samples `[start, end)` of a
+    /// Per-channel mean absolute amplitude over samples `[start, end)` of a
     /// mono analysis.
-    pub fn column_peaks(&self, start: u64, end: u64, out: &mut [f32]) {
+    pub fn column_means(&self, start: u64, end: u64, out: &mut [f32]) {
         out.fill(0.0);
         let num_ch = self.header.num_channels as usize;
-        for row in self.rows(start, end).chunks_exact(num_ch) {
-            for (peak, &value) in out.iter_mut().zip(row.iter()) {
-                *peak = peak.max(value.abs());
+        let rows = self.rows(start, end);
+        let count = rows.len() / num_ch;
+        for row in rows.chunks_exact(num_ch) {
+            for (mean, &value) in out.iter_mut().zip(row.iter()) {
+                *mean += value.abs();
+            }
+        }
+        if count > 0 {
+            for mean in out.iter_mut() {
+                *mean /= count as f32;
             }
         }
     }
@@ -1851,19 +1858,19 @@ impl AnalysisReader {
     }
 
     /// One-pass aggregation of a binaural column over samples `[start, end)`:
-    /// per-channel absolute peaks of the stored dcGC mean plus per-channel
+    /// per-channel sums of the absolute stored dcGC mean plus per-channel
     /// sums of the lowest-activity unit's characteristic IID and ITD
-    /// (`iid_sums` and `itd_sums` are `num_channels` long). The renderer
-    /// divides the sums by the sample count to get column means.
+    /// (`dcgc_sums`, `iid_sums`, and `itd_sums` are `num_channels` long). The
+    /// renderer divides the sums by the sample count to get column means.
     pub fn aggregate_binaural_column(
         &self,
         start: u64,
         end: u64,
-        peaks: &mut [f32],
+        dcgc_sums: &mut [f32],
         iid_sums: &mut [f32],
         itd_sums: &mut [f32],
     ) {
-        peaks.fill(0.0);
+        dcgc_sums.fill(0.0);
         iid_sums.fill(0.0);
         itd_sums.fill(0.0);
         let num_ch = self.header.num_channels as usize;
@@ -1872,8 +1879,8 @@ impl AnalysisReader {
             let (dcgc, rest) = row.split_at(num_ch);
             let (iid, rest) = rest.split_at(num_ch);
             let (itd, _) = rest.split_at(num_ch);
-            for (peak, &value) in peaks.iter_mut().zip(dcgc.iter()) {
-                *peak = peak.max(value.abs());
+            for (sum, &value) in dcgc_sums.iter_mut().zip(dcgc.iter()) {
+                *sum += value.abs();
             }
             for (sum, &value) in iid_sums.iter_mut().zip(iid.iter()) {
                 *sum += value;
@@ -2392,17 +2399,17 @@ mod tests {
         assert_eq!(reader.ei_row(0).len(), 32);
 
         let num_ch = 32_usize;
-        let mut peaks = vec![0.0_f32; num_ch];
+        let mut dcgc_sums = vec![0.0_f32; num_ch];
         let mut iid_sums = vec![0.0_f32; num_ch];
         let mut itd_sums = vec![0.0_f32; num_ch];
         reader.aggregate_binaural_column(
             0,
             header.num_samples,
-            &mut peaks,
+            &mut dcgc_sums,
             &mut iid_sums,
             &mut itd_sums,
         );
-        assert!(peaks.iter().all(|&p| p > 0.0));
+        assert!(dcgc_sums.iter().all(|&s| s > 0.0));
 
         let channel = channel_near(&header, 500.0);
         let itd = itd_sums[channel] as f64 / header.num_samples as f64;
@@ -2440,13 +2447,13 @@ mod tests {
 
         let reader = AnalysisReader::open(&gca).unwrap();
         let num_ch = 24_usize;
-        let mut peaks = vec![0.0_f32; num_ch];
+        let mut dcgc_sums = vec![0.0_f32; num_ch];
         let mut iid_sums = vec![0.0_f32; num_ch];
         let mut itd_sums = vec![0.0_f32; num_ch];
         reader.aggregate_binaural_column(
             0,
             header.num_samples,
-            &mut peaks,
+            &mut dcgc_sums,
             &mut iid_sums,
             &mut itd_sums,
         );
@@ -2633,17 +2640,17 @@ mod tests {
         assert!(reader.dcgc_row(0).iter().all(|&value| value >= 0.0));
 
         let num_ch = 32_usize;
-        let mut peaks = vec![0.0_f32; num_ch];
+        let mut dcgc_sums = vec![0.0_f32; num_ch];
         let mut iid_sums = vec![0.0_f32; num_ch];
         let mut itd_sums = vec![0.0_f32; num_ch];
         reader.aggregate_binaural_column(
             0,
             header.num_samples,
-            &mut peaks,
+            &mut dcgc_sums,
             &mut iid_sums,
             &mut itd_sums,
         );
-        assert!(peaks.iter().any(|&p| p > 0.0));
+        assert!(dcgc_sums.iter().any(|&s| s > 0.0));
 
         // The EI path is unaffected by reassignment: the right-ear delay
         // still shows up as the characteristic ITD (τ = −d paper-symmetric).
