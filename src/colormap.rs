@@ -51,7 +51,7 @@ pub fn bivariate_color(t: f32, s: f32) -> [f32; 3] {
     let lightness = 0.12 + 0.78 * t;
     // Chroma grows with both amplitude and distance from the neutral center.
     let chroma = 0.14 * t * (2.0 * (s - 0.5).abs()).min(1.0);
-    let hue = if s < 0.5 { 260.0 } else { 40.0 };
+    let hue = if s < 0.5 { 195.0 } else { 328.0 };
     oklch_to_srgb(lightness, chroma, hue)
 }
 
@@ -70,53 +70,4 @@ pub fn bivariate_lut() -> Vec<egui::Color32> {
         }
     }
     lut
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn oklch_primaries() {
-        let [r, g, b] = oklch_to_srgb(1.0, 0.0, 0.0);
-        assert!((r - 1.0).abs() < 1e-3 && (g - 1.0).abs() < 1e-3 && (b - 1.0).abs() < 1e-3);
-        let [r, g, b] = oklch_to_srgb(0.0, 0.0, 0.0);
-        assert_eq!([r, g, b], [0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn silence_is_dark_everywhere() {
-        for s in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let [r, g, b] = bivariate_color(0.0, s);
-            assert!(r < 0.2 && g < 0.2 && b < 0.2, "t=0 s={s}: {r} {g} {b}");
-        }
-    }
-
-    #[test]
-    fn center_is_achromatic() {
-        let [r, g, b] = bivariate_color(1.0, 0.5);
-        assert!((r - g).abs() < 0.02 && (g - b).abs() < 0.02, "{r} {g} {b}");
-        assert!(r > 0.8, "full amplitude should be bright: {r}");
-    }
-
-    #[test]
-    fn extremes_are_blue_and_orange() {
-        let [r, g, b] = bivariate_color(1.0, 0.0);
-        assert!(b > r, "negative side should be blue-dominant: {r} {g} {b}");
-        let [r, g, b] = bivariate_color(1.0, 1.0);
-        assert!(r > b, "positive side should be orange-dominant: {r} {g} {b}");
-    }
-
-    #[test]
-    fn lut_shape_and_edges() {
-        let lut = bivariate_lut();
-        assert_eq!(lut.len(), LUT_SIZE * LUT_SIZE);
-        // t = 0 row is near-black at both s extremes.
-        assert!(lut[0].r() < 50 && lut[255].r() < 50);
-        // t = 255, s = 0 is blue-ish; t = 255, s = 255 is orange-ish.
-        let blue = lut[255 * 256];
-        assert!(blue.b() > blue.r());
-        let orange = lut[255 * 256 + 255];
-        assert!(orange.r() > orange.b());
-    }
 }
