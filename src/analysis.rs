@@ -2162,6 +2162,7 @@ mod tests {
             gc: GcParam {
                 num_ch: 32,
                 f_range: [40.0, 16_000.0],
+                ctrl: ControlMode::Dynamic,
                 ..BuilderParams::default().gc
             },
             ..BuilderParams::default()
@@ -2498,6 +2499,11 @@ mod tests {
 
         let params = BuilderParams {
             mode: AnalysisMode::Binaural,
+            gc: GcParam {
+                ctrl: ControlMode::Dynamic,
+                num_ch: 100,
+                ..BuilderParams::default().gc
+            },
             binaural: BinauralParams {
                 peripheral: PeripheralConfig {
                     absolute_threshold_noise_level_db_spl: None,

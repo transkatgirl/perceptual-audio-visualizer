@@ -15,3 +15,6 @@ memmap2 = "0.9"
 rfd = "0.17"
 bytemuck = "1"
 ndarray = "0.17"
+
+[profile.dev]
+opt-level = 3
