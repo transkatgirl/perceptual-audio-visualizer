@@ -317,7 +317,7 @@ impl Default for BuilderParams {
                 num_ch: 350,
                 f_range: [40.0, 16_000.0],
                 out_mid_crct: "ELC".into(),
-                ctrl: ControlMode::Dynamic,
+                ctrl: ControlMode::Static,
                 dyn_hpaf: DynHpaf {
                     str_prc: "sample-base".into(),
                     ..DynHpaf::default()
