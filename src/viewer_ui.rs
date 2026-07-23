@@ -545,7 +545,7 @@ impl ViewerTab {
             if self.auto_range {
                 let new_ceil = auto_ceiling(&loaded.reader, *view_start, *view_span);
                 if let Some(last_auto_range) = self.last_auto_range {
-                    if last_auto_range.elapsed() > Duration::from_millis(50) {
+                    if last_auto_range.elapsed() > Duration::from_millis(50) || !(playing && *follow) {
                         self.last_auto_range = None;
                     } else {
                         ui.request_repaint();
