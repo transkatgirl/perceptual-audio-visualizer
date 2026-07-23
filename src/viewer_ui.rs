@@ -28,7 +28,7 @@ fn value_db(value_kind: u32, value: f32) -> f32 {
 /// this many columns wide, so zoom level maps to samples-per-column.
 const TEX_W: usize = 4096;
 const MIN_SPAN: f64 = 0.05;
-const MAX_SPAN: f64 = 20.0;
+const MAX_SPAN: f64 = 10.0;
 
 pub struct ViewerTab {
     audio_path: Option<PathBuf>,
@@ -123,7 +123,6 @@ impl ViewerTab {
         let complete = reader.is_complete();
         self.view_start = 0.0;
         self.view_span = duration.clamp(MIN_SPAN, MAX_SPAN.min(duration.max(MIN_SPAN)));
-        self.ceil_db = auto_ceiling(&reader, self.view_start, self.view_span);
         self.follow = true;
         self.loaded = Some(Loaded {
             spec: Spectrogram::new(ctx, &reader),
