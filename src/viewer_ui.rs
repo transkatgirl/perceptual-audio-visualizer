@@ -536,7 +536,12 @@ impl ViewerTab {
             let ceil_changed = ui
                 .add(egui::Slider::new(ceil_db, -120.0..=20.0).text("ceiling"))
                 .changed();
-            ui.checkbox(&mut self.auto_range, "Auto range");
+            if ui.checkbox(&mut self.auto_range, "Auto range").changed() && self.auto_range {
+                *ceil_db = auto_ceiling(&loaded.reader, *view_start, *view_span);
+                *floor_db = (*ceil_db - 45.0).max(-140.0);
+                loaded.spec.invalidate();
+                ui.request_repaint();
+            };
             if self.auto_range {
                 let new_ceil = auto_ceiling(&loaded.reader, *view_start, *view_span);
                 if let Some(last_auto_range) = self.last_auto_range {
