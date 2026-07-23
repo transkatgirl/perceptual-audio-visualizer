@@ -388,7 +388,7 @@ impl BuilderTab {
                             .speed(10.0),
                     );
                     ui.label("Channels");
-                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=2048));
+                    ui.add(egui::DragValue::new(&mut gc.num_ch).range(2..=1400));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Control");
@@ -1081,8 +1081,13 @@ fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, save: bo
             if save {
                 dialog = dialog.add_filter("gammachirp analysis", &["gca"]);
             } else {
-                dialog =
-                    dialog.add_filter("audio", &["wav", "flac", "mp3", "ogg", "m4a", "mp4", "aac"]);
+                dialog = dialog.add_filter(
+                    "audio",
+                    &[
+                        "wav", "flac", "mp3", "ogg", "opus", "m4a", "mp4", "mkv", "mka", "webm",
+                        "aac", "aif", "aiff", "caf", "alac",
+                    ],
+                );
             }
             let picked = if save {
                 dialog.save_file()

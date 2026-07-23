@@ -948,7 +948,13 @@ fn file_row(ui: &mut egui::Ui, label: &str, path: &mut Option<PathBuf>, analysis
         dialog = if analysis {
             dialog.add_filter("gammachirp analysis", &["gca"])
         } else {
-            dialog.add_filter("audio", &["wav", "flac", "mp3", "ogg", "m4a", "mp4", "aac"])
+            dialog.add_filter(
+                "audio",
+                &[
+                    "wav", "flac", "mp3", "ogg", "opus", "m4a", "mp4", "mkv", "mka", "webm", "aac",
+                    "aif", "aiff", "caf", "alac",
+                ],
+            )
         };
         if let Some(picked) = dialog.pick_file() {
             *path = Some(picked);
