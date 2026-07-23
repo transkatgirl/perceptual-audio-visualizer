@@ -37,6 +37,7 @@ pub struct ViewerTab {
     status_is_error: bool,
     loaded: Option<Loaded>,
     follow: bool,
+    auto_range: bool,
     view_start: f64,
     view_span: f64,
     floor_db: f32,
@@ -65,6 +66,7 @@ impl Default for ViewerTab {
             status_is_error: false,
             loaded: None,
             follow: true,
+            auto_range: false,
             view_start: 0.0,
             view_span: 5.0,
             floor_db: -100.0,
@@ -529,16 +531,28 @@ impl ViewerTab {
             let ceil_changed = ui
                 .add(egui::Slider::new(ceil_db, -120.0..=20.0).text("ceiling"))
                 .changed();
-            if ui.button("Auto range").clicked() {
-                *ceil_db = auto_ceiling(&loaded.reader, *view_start, *view_span);
-                *floor_db = (*ceil_db - 45.0).max(-140.0);
-                loaded.spec.invalidate();
+            ui.checkbox(&mut self.auto_range, "Auto range");
+            if self.auto_range {
+                let new_ceil = auto_ceiling(&loaded.reader, *view_start, *view_span);
+                if (new_ceil - *ceil_db) > 1.5 {
+                    *ceil_db += 0.05;
+                    *floor_db = (*ceil_db - 45.0).max(-140.0);
+                    loaded.spec.invalidate();
+                    ui.request_repaint();
+                }
+                if (*ceil_db - new_ceil) > 1.5 {
+                    *ceil_db -= 0.05;
+                    *floor_db = (*ceil_db - 45.0).max(-140.0);
+                    loaded.spec.invalidate();
+                    ui.request_repaint();
+                }
             }
             if floor_changed || ceil_changed {
                 if *floor_db >= *ceil_db {
                     *floor_db = *ceil_db - 6.0;
                 }
                 loaded.spec.invalidate();
+                ui.request_repaint();
             }
             if loaded.reader.is_binaural() {
                 ui.separator();
@@ -558,6 +572,7 @@ impl ViewerTab {
                     });
                 if stereo_changed {
                     loaded.spec.invalidate();
+                    ui.request_repaint();
                 }
             }
             ui.separator();
