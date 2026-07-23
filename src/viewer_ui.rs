@@ -2,8 +2,11 @@
 //! with seeking, pausing, zooming, and panning. Only the visible time window is
 //! ever read from disk; the audio decoder streams.
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use eframe::egui;
 use rodio::{DeviceSinkBuilder, Player};
@@ -42,6 +45,7 @@ pub struct ViewerTab {
     view_span: f64,
     floor_db: f32,
     ceil_db: f32,
+    last_auto_range: Option<Instant>,
 }
 
 struct Loaded {
@@ -71,6 +75,7 @@ impl Default for ViewerTab {
             view_span: 5.0,
             floor_db: -100.0,
             ceil_db: -55.0,
+            last_auto_range: None,
         }
     }
 }
@@ -534,17 +539,28 @@ impl ViewerTab {
             ui.checkbox(&mut self.auto_range, "Auto range");
             if self.auto_range {
                 let new_ceil = auto_ceiling(&loaded.reader, *view_start, *view_span);
-                if (new_ceil - *ceil_db) > 1.5 {
-                    *ceil_db += 0.05;
-                    *floor_db = (*ceil_db - 45.0).max(-140.0);
-                    loaded.spec.invalidate();
-                    ui.request_repaint();
+                if let Some(last_auto_range) = self.last_auto_range {
+                    if last_auto_range.elapsed() > Duration::from_millis(50) {
+                        self.last_auto_range = None;
+                    } else {
+                        ui.request_repaint();
+                    }
                 }
-                if (*ceil_db - new_ceil) > 1.5 {
-                    *ceil_db -= 0.05;
-                    *floor_db = (*ceil_db - 45.0).max(-140.0);
-                    loaded.spec.invalidate();
-                    ui.request_repaint();
+                if self.last_auto_range.is_none() {
+                    if (new_ceil - *ceil_db) > 2.0 {
+                        *ceil_db += 0.1;
+                        *floor_db = (*ceil_db - 45.0).max(-140.0);
+                        loaded.spec.invalidate();
+                        ui.request_repaint();
+                        self.last_auto_range = Some(Instant::now());
+                    }
+                    if (*ceil_db - new_ceil) > 2.0 {
+                        *ceil_db -= 0.1;
+                        *floor_db = (*ceil_db - 45.0).max(-140.0);
+                        loaded.spec.invalidate();
+                        ui.request_repaint();
+                        self.last_auto_range = Some(Instant::now());
+                    }
                 }
             }
             if floor_changed || ceil_changed {
