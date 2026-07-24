@@ -937,8 +937,10 @@ fn auto_ceiling(reader: &AnalysisReader, view_start: f64, view_span: f64) -> f32
     value_db(reader.header.value_kind, max).ceil()
 }
 
-/// Approximate matplotlib "magma" via anchor-point interpolation.
+/// Approximate matplotlib "magma" via anchor-point interpolation in the
+/// OkLCH color space.
 fn magma_lut() -> Vec<egui::Color32> {
+    use crate::colormap::{oklch_to_srgb, srgb_to_oklch};
     const ANCHORS: [(f32, (u8, u8, u8)); 9] = [
         (0.00, (0, 0, 4)),
         (0.13, (28, 16, 68)),
@@ -950,19 +952,38 @@ fn magma_lut() -> Vec<egui::Color32> {
         (0.88, (254, 194, 135)),
         (1.00, (252, 253, 245)),
     ];
+    let anchors = ANCHORS.map(|(t, (r, g, b))| {
+        (
+            t,
+            srgb_to_oklch(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            ),
+        )
+    });
     (0..256)
         .map(|i| {
             let t = i as f32 / 255.0;
-            let upper = ANCHORS
+            let upper = anchors
                 .iter()
                 .position(|(at, _)| t <= *at)
-                .unwrap_or(ANCHORS.len() - 1)
+                .unwrap_or(anchors.len() - 1)
                 .max(1);
-            let (t0, c0) = ANCHORS[upper - 1];
-            let (t1, c1) = ANCHORS[upper];
+            let (t0, (l0, c0, h0)) = anchors[upper - 1];
+            let (t1, (l1, c1, h1)) = anchors[upper];
             let f = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
-            let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * f) as u8;
-            egui::Color32::from_rgb(mix(c0.0, c1.0), mix(c0.1, c1.1), mix(c0.2, c1.2))
+            let l = l0 + (l1 - l0) * f;
+            let c = c0 + (c1 - c0) * f;
+            // Hue takes the shortest path around the circle.
+            let dh = (h1 - h0 + 540.0).rem_euclid(360.0) - 180.0;
+            let h = h0 + dh * f;
+            let [r, g, b] = oklch_to_srgb(l, c, h);
+            egui::Color32::from_rgb(
+                (r * 255.0).round() as u8,
+                (g * 255.0).round() as u8,
+                (b * 255.0).round() as u8,
+            )
         })
         .collect()
 }

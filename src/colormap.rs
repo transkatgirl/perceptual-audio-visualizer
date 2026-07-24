@@ -43,6 +43,35 @@ pub fn oklch_to_srgb(l: f32, c: f32, h_degrees: f32) -> [f32; 3] {
     })
 }
 
+/// Convert sRGB (each component in 0..=1) to OkLCH `(lightness, chroma, hue)`
+/// with the hue in degrees. The inverse of [`oklch_to_srgb`].
+pub fn srgb_to_oklch(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
+    let linear = |srgb: f32| {
+        if srgb <= 0.040_45 {
+            srgb / 12.92
+        } else {
+            ((srgb + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = linear(red);
+    let g = linear(green);
+    let b = linear(blue);
+
+    let l = 0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_993 * b;
+    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
+    let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
+    let l_ = l.cbrt();
+    let m_ = m.cbrt();
+    let s_ = s.cbrt();
+
+    let lightness = 0.210_454_26 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_;
+    let a = 1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_;
+    let b_ = 0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_;
+    let chroma = a.hypot(b_);
+    let hue = b_.atan2(a).to_degrees().rem_euclid(360.0);
+    (lightness, chroma, hue)
+}
+
 /// The bivariate color at normalized amplitude `t` ∈ [0, 1] and normalized
 /// interaural variable `s` ∈ [0, 1] (0.5 = no interaural difference).
 pub fn bivariate_color(t: f32, s: f32) -> [f32; 3] {
@@ -70,4 +99,39 @@ pub fn bivariate_lut() -> Vec<egui::Color32> {
         }
     }
     lut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `oklch_to_srgb` must invert `srgb_to_oklch` for in-gamut colors:
+    /// every sRGB color survives the roundtrip.
+    #[test]
+    fn oklch_srgb_roundtrip() {
+        for (r, g, b) in [
+            (0_u8, 0, 4),
+            (28, 16, 68),
+            (79, 18, 123),
+            (129, 37, 129),
+            (181, 54, 122),
+            (229, 80, 100),
+            (251, 135, 97),
+            (254, 194, 135),
+            (252, 253, 245),
+            (0, 0, 0),
+            (255, 255, 255),
+            (17, 220, 96),
+        ] {
+            let rgb = [r, g, b].map(|v| f32::from(v) / 255.0);
+            let (l, c, h) = srgb_to_oklch(rgb[0], rgb[1], rgb[2]);
+            let roundtrip = oklch_to_srgb(l, c, h);
+            for (before, after) in rgb.iter().zip(roundtrip) {
+                assert!(
+                    (before - after).abs() < 2e-3,
+                    "{rgb:?} -> ({l}, {c}, {h}) -> {roundtrip:?}"
+                );
+            }
+        }
+    }
 }
