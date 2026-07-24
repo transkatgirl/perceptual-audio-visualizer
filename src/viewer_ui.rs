@@ -505,15 +505,25 @@ impl ViewerTab {
                 let amp = loaded.reader.dcgc_row(sample)[ch].abs();
                 let db = value_db(loaded.reader.header.value_kind, amp);
                 let iid_db = loaded.reader.iid_row(sample)[ch];
-                let itd_ms = loaded.reader.itd_row(sample)[ch] * 1e3;
-                let ei_mu = loaded.reader.ei_row(sample)[ch];
-                response.clone().on_hover_text(format!(
-                    "{} · {:.0} Hz (ch {}) · {:.1} {value_label} · {iid_db:+.1} dB IID · {itd_ms:.2} ms ITD · {ei_mu:.3} MU EI",
-                    fmt_time(time),
-                    loaded.reader.header.channel_freqs[ch],
-                    ch,
-                    db,
-                ));
+                if loaded.reader.is_iid_only() {
+                    response.clone().on_hover_text(format!(
+                        "{} · {:.0} Hz (ch {}) · {:.1} {value_label} · {iid_db:+.1} dB IID",
+                        fmt_time(time),
+                        loaded.reader.header.channel_freqs[ch],
+                        ch,
+                        db,
+                    ));
+                } else {
+                    let itd_ms = loaded.reader.itd_row(sample)[ch] * 1e3;
+                    let ei_mu = loaded.reader.ei_row(sample)[ch];
+                    response.clone().on_hover_text(format!(
+                        "{} · {:.0} Hz (ch {}) · {:.1} {value_label} · {iid_db:+.1} dB IID · {itd_ms:.2} ms ITD · {ei_mu:.3} MU EI",
+                        fmt_time(time),
+                        loaded.reader.header.channel_freqs[ch],
+                        ch,
+                        db,
+                    ));
+                }
             } else {
                 let value = loaded.reader.row(sample as u64)[ch];
                 let db = value_db(loaded.reader.header.value_kind, value);
@@ -575,7 +585,7 @@ impl ViewerTab {
                 loaded.spec.invalidate();
                 ui.request_repaint();
             }
-            if loaded.reader.is_binaural() {
+            if loaded.reader.is_binaural() && !loaded.reader.is_iid_only() {
                 ui.separator();
                 let mut stereo_changed = false;
                 egui::ComboBox::from_label("Stereo variable")

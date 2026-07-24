@@ -17,7 +17,7 @@
 //! 40  f64  f_range_high
 //! 48  u32  control_mode (0=Static, 1=Dynamic, 2=Level)
 //! 52  u32  header_len = 72 + 8*(num_channels + num_tau + num_iid + num_scales)
-//! 56  u32  mode (0 = mono, 1 = binaural)
+//! 56  u32  mode (0 = mono, 1 = binaural, 2 = binaural IID-only)
 //! 60  u32  num_tau (ITD grid size; 0 for mono)
 //! 64  u32  num_iid (IID grid size; 0 for mono)
 //! 68  u32  value_kind (0 = dcGC amplitude, 1 = reassigned energy,
@@ -33,6 +33,9 @@
 //!                         values plus the characteristic IID (dB) and ITD
 //!                         (seconds) of the lowest-activity EI unit plus that
 //!                         unit's activity
+//!               IID-only: per sample [values num_ch][iid num_ch] — the same
+//!                         binaural analysis, storing only the characteristic
+//!                         IID of the lowest-activity EI unit
 //! ```
 //!
 //! The stored values depend on `value_kind`: dcGC amplitudes (mono) or the
@@ -77,6 +80,7 @@ const NUM_SAMPLES_OFFSET: u64 = 24;
 /// Numeric analysis-mode tags stored in the file header.
 pub const MODE_MONO: u32 = 0;
 pub const MODE_BINAURAL: u32 = 1;
+pub const MODE_BINAURAL_IID: u32 = 2;
 
 /// Numeric stored-value tags stored in the file header.
 pub const VALUE_AMPLITUDE: u32 = 0;
@@ -145,6 +149,10 @@ pub enum AnalysisMode {
     /// Breebaart-2001 / GCFB hybrid of a stereo input: per-ear GCFB plus an
     /// excitation-inhibition population tuned to interaural time differences.
     Binaural,
+    /// The same Breebaart-2001 hybrid as [`AnalysisMode::Binaural`], but only
+    /// the characteristic IID of the lowest-activity EI unit is written to
+    /// disk (no ITD or EI activity blocks), halving the per-sample row.
+    BinauralIid,
 }
 
 impl AnalysisMode {
@@ -153,7 +161,14 @@ impl AnalysisMode {
         match self {
             AnalysisMode::Mono => MODE_MONO,
             AnalysisMode::Binaural => MODE_BINAURAL,
+            AnalysisMode::BinauralIid => MODE_BINAURAL_IID,
         }
+    }
+
+    /// True for the binaural modes, which require a stereo input and run the
+    /// Breebaart-2001 EI population.
+    pub fn is_binaural(self) -> bool {
+        matches!(self, AnalysisMode::Binaural | AnalysisMode::BinauralIid)
     }
 }
 
@@ -162,6 +177,7 @@ pub fn mode_label(tag: u32) -> &'static str {
     match tag {
         MODE_MONO => "Mono",
         MODE_BINAURAL => "Binaural",
+        MODE_BINAURAL_IID => "Binaural IID-only",
         _ => "Unknown",
     }
 }
@@ -220,7 +236,8 @@ impl AnalysisValues {
 ///
 /// The population is a two-dimensional grid over characteristic ITD and IID
 /// (like the `breebaart2001_hybrid` example); per channel and sample only the
-/// lowest-activity unit's characteristic IID, ITD, and activity are stored.
+/// lowest-activity unit's characteristic IID, ITD, and activity are stored
+/// (IID-only mode stores just the characteristic IID).
 /// `ei.integration_boundary` is forced to causal zero-state and
 /// `ei.max_abs_delay_seconds` to `tau_max_seconds` by the builder; every
 /// other item is user-facing.
@@ -304,7 +321,8 @@ impl BinauralParams {
 pub struct BuilderParams {
     pub gc: GcParam,
     pub mode: AnalysisMode,
-    /// Used only when `mode` is [`AnalysisMode::Binaural`].
+    /// Used only when `mode` is [`AnalysisMode::Binaural`] or
+    /// [`AnalysisMode::BinauralIid`].
     pub binaural: BinauralParams,
     /// Which per-sample values the analysis stores.
     pub values: AnalysisValues,
@@ -317,7 +335,7 @@ impl Default for BuilderParams {
                 num_ch: 350,
                 f_range: [40.0, 16_000.0],
                 out_mid_crct: "ELC".into(),
-                ctrl: ControlMode::Static,
+                ctrl: ControlMode::Dynamic,
                 dyn_hpaf: DynHpaf {
                     str_prc: "sample-base".into(),
                     ..DynHpaf::default()
@@ -328,7 +346,7 @@ impl Default for BuilderParams {
                 },
                 ..GcParam::default()
             },
-            mode: AnalysisMode::Mono,
+            mode: AnalysisMode::BinauralIid,
             binaural: BinauralParams::default(),
             values: AnalysisValues::Amplitude,
         }
@@ -393,13 +411,14 @@ impl AnalysisHeader {
 
     /// f32 values stored per sample: `num_ch` for mono, `4 * num_ch` for
     /// binaural (the stored values plus the lowest EI unit's IID, ITD, and
-    /// activity).
+    /// activity), `2 * num_ch` for IID-only binaural (the stored values plus
+    /// the IID only).
     pub fn values_per_sample(&self) -> usize {
         let num_ch = self.num_channels as usize;
-        if self.mode == MODE_BINAURAL {
-            4 * num_ch
-        } else {
-            num_ch
+        match self.mode {
+            MODE_BINAURAL => 4 * num_ch,
+            MODE_BINAURAL_IID => 2 * num_ch,
+            _ => num_ch,
         }
     }
 
@@ -464,7 +483,7 @@ impl AnalysisHeader {
             return Err(invalid(&format!("unsupported engine {engine}")));
         }
         let mode = read_u32(56);
-        if mode != MODE_MONO && mode != MODE_BINAURAL {
+        if mode != MODE_MONO && mode != MODE_BINAURAL && mode != MODE_BINAURAL_IID {
             return Err(invalid(&format!("unknown analysis mode {mode}")));
         }
         let value_kind = read_u32(68);
@@ -637,10 +656,10 @@ pub fn run_analysis(
         (AnalysisMode::Mono, values) => {
             run_mono_reassigned_inner(input, output, params, values, &mut progress, cancel)
         }
-        (AnalysisMode::Binaural, AnalysisValues::Amplitude) => {
+        (AnalysisMode::Binaural | AnalysisMode::BinauralIid, AnalysisValues::Amplitude) => {
             run_binaural_inner(input, output, params, &mut progress, cancel)
         }
-        (AnalysisMode::Binaural, values) => {
+        (AnalysisMode::Binaural | AnalysisMode::BinauralIid, values) => {
             run_binaural_reassigned_inner(input, output, params, values, &mut progress, cancel)
         }
     };
@@ -1140,9 +1159,9 @@ fn process_chain_chunk(
 
 /// Binaural output assembly: the mean of the per-ear dcGC rows is buffered
 /// for the short EI latency, then interleaved with the lowest-EI-unit data as
-/// `[dcgc_mean | iid | itd | ei]` rows. EI events arrive in sample order,
-/// exactly one per input sample, so the queue head always matches the next
-/// event.
+/// `[dcgc_mean | iid | itd | ei]` rows (`[dcgc_mean | iid]` in IID-only
+/// mode). EI events arrive in sample order, exactly one per input sample, so
+/// the queue head always matches the next event.
 struct BinauralState {
     pending: VecDeque<Vec<f32>>,
     units: Vec<EiUnit>,
@@ -1151,18 +1170,21 @@ struct BinauralState {
     ei_block: Vec<f32>,
     write_buf: Vec<f32>,
     num_samples: u64,
+    iid_only: bool,
 }
 
 impl BinauralState {
-    fn new(chunk_len: usize, num_ch: usize, units: Vec<EiUnit>) -> Self {
+    fn new(chunk_len: usize, num_ch: usize, units: Vec<EiUnit>, iid_only: bool) -> Self {
+        let blocks = if iid_only { 2 } else { 4 };
         Self {
             pending: VecDeque::new(),
             units,
             iid_block: vec![0.0; num_ch],
             itd_block: vec![0.0; num_ch],
             ei_block: vec![0.0; num_ch],
-            write_buf: Vec::with_capacity(chunk_len * 4 * num_ch),
+            write_buf: Vec::with_capacity(chunk_len * blocks * num_ch),
             num_samples: 0,
+            iid_only,
         }
     }
 
@@ -1209,8 +1231,10 @@ impl BinauralState {
             self.ei_block[ch] = activity as f32;
         }
         self.write_buf.extend_from_slice(&self.iid_block);
-        self.write_buf.extend_from_slice(&self.itd_block);
-        self.write_buf.extend_from_slice(&self.ei_block);
+        if !self.iid_only {
+            self.write_buf.extend_from_slice(&self.itd_block);
+            self.write_buf.extend_from_slice(&self.ei_block);
+        }
         self.num_samples += 1;
         Ok(())
     }
@@ -1294,7 +1318,8 @@ fn run_binaural_inner(
 
     let decoder = streaming_decoder(input)?;
     let chunk_len = (probe.sample_rate as usize / 4).max(1); // ~0.25 s of audio
-    let mut state = BinauralState::new(chunk_len, num_ch, units);
+    let iid_only = params.mode == AnalysisMode::BinauralIid;
+    let mut state = BinauralState::new(chunk_len, num_ch, units, iid_only);
 
     let mut left_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
     let mut right_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
@@ -1423,21 +1448,25 @@ fn ei_blocks(event: &EiStreamSample, units: &[EiUnit]) -> EiBlocks {
 /// Binaural reassignment assembly: EI blocks arrive from the hybrid stream
 /// in sample order; reassigned (or salience) columns arrive from the two
 /// per-ear chains in column order. Both queues are joined front-to-front, so
-/// each emitted row is `[values mean | iid | itd | ei]` for one sample.
+/// each emitted row is `[values mean | iid | itd | ei]` for one sample
+/// (`[values mean | iid]` in IID-only mode).
 struct BinauralReassignedState {
     pending_ei: VecDeque<EiBlocks>,
     pending_values: VecDeque<Vec<f32>>,
     write_buf: Vec<f32>,
     num_samples: u64,
+    iid_only: bool,
 }
 
 impl BinauralReassignedState {
-    fn new(chunk_len: usize, num_ch: usize) -> Self {
+    fn new(chunk_len: usize, num_ch: usize, iid_only: bool) -> Self {
+        let blocks = if iid_only { 2 } else { 4 };
         Self {
             pending_ei: VecDeque::new(),
             pending_values: VecDeque::new(),
-            write_buf: Vec::with_capacity(chunk_len * 4 * num_ch),
+            write_buf: Vec::with_capacity(chunk_len * blocks * num_ch),
             num_samples: 0,
+            iid_only,
         }
     }
 
@@ -1477,8 +1506,10 @@ impl BinauralReassignedState {
             }
             self.write_buf.extend_from_slice(&values);
             self.write_buf.extend_from_slice(&ei.iid);
-            self.write_buf.extend_from_slice(&ei.itd);
-            self.write_buf.extend_from_slice(&ei.ei);
+            if !self.iid_only {
+                self.write_buf.extend_from_slice(&ei.itd);
+                self.write_buf.extend_from_slice(&ei.ei);
+            }
             self.num_samples += 1;
         }
         Ok(())
@@ -1570,7 +1601,8 @@ fn run_binaural_reassigned_inner(
 
     let decoder = streaming_decoder(input)?;
     let chunk_len = (probe.sample_rate as usize / 4).max(1); // ~0.25 s of audio
-    let mut state = BinauralReassignedState::new(chunk_len, num_ch);
+    let iid_only = params.mode == AnalysisMode::BinauralIid;
+    let mut state = BinauralReassignedState::new(chunk_len, num_ch, iid_only);
 
     let mut left_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
     let mut right_chunk: Vec<f64> = Vec::with_capacity(chunk_len);
@@ -1778,9 +1810,16 @@ impl AnalysisReader {
         self.complete
     }
 
-    /// True for a binaural (dcGC mean + EI population) analysis.
+    /// True for a binaural (dcGC mean + EI population) analysis, either the
+    /// standard mode storing IID, ITD, and EI activity or the IID-only mode.
     pub fn is_binaural(&self) -> bool {
-        self.header.mode == MODE_BINAURAL
+        self.header.mode == MODE_BINAURAL || self.header.mode == MODE_BINAURAL_IID
+    }
+
+    /// True for an IID-only binaural analysis: only the values and
+    /// characteristic-IID blocks are stored (no ITD or EI activity blocks).
+    pub fn is_iid_only(&self) -> bool {
+        self.header.mode == MODE_BINAURAL_IID
     }
 
     /// The complete sample-major matrix as `num_samples * values_per_sample`
@@ -1826,7 +1865,8 @@ impl AnalysisReader {
     }
 
     /// Samples `[start, end)` of a binaural analysis as contiguous
-    /// `[dcgc_mean | iid | itd | ei]` rows of `values_per_sample` floats.
+    /// `[dcgc_mean | iid | itd | ei]` rows of `values_per_sample` floats
+    /// (`[dcgc_mean | iid]` for IID-only analyses).
     fn binaural_rows(&self, start: u64, end: u64) -> &[f32] {
         debug_assert!(self.is_binaural());
         let stride = self.header.values_per_sample();
@@ -1850,15 +1890,18 @@ impl AnalysisReader {
     }
 
     /// Characteristic ITD in seconds of the lowest-activity EI unit, per
-    /// channel, for one sample of a binaural analysis.
+    /// channel, for one sample of a standard binaural analysis. IID-only
+    /// analyses store no ITD block.
     pub fn itd_row(&self, sample: u64) -> &[f32] {
+        debug_assert_eq!(self.header.mode, MODE_BINAURAL);
         let num_ch = self.header.num_channels as usize;
         &self.binaural_rows(sample, sample + 1)[2 * num_ch..3 * num_ch]
     }
 
     /// Activity of the lowest-activity EI unit, per channel, for one sample
-    /// of a binaural analysis.
+    /// of a standard binaural analysis. IID-only analyses store no EI block.
     pub fn ei_row(&self, sample: u64) -> &[f32] {
+        debug_assert_eq!(self.header.mode, MODE_BINAURAL);
         let num_ch = self.header.num_channels as usize;
         &self.binaural_rows(sample, sample + 1)[3 * num_ch..]
     }
@@ -1868,6 +1911,7 @@ impl AnalysisReader {
     /// sums of the lowest-activity unit's characteristic IID and ITD
     /// (`dcgc_sums`, `iid_sums`, and `itd_sums` are `num_channels` long). The
     /// renderer divides the sums by the sample count to get column means.
+    /// IID-only analyses store no ITD block, so `itd_sums` stays zero.
     pub fn aggregate_binaural_column(
         &self,
         start: u64,
@@ -1884,15 +1928,17 @@ impl AnalysisReader {
         for row in self.binaural_rows(start, end).chunks_exact(stride) {
             let (dcgc, rest) = row.split_at(num_ch);
             let (iid, rest) = rest.split_at(num_ch);
-            let (itd, _) = rest.split_at(num_ch);
             for (sum, &value) in dcgc_sums.iter_mut().zip(dcgc.iter()) {
                 *sum += value.abs();
             }
             for (sum, &value) in iid_sums.iter_mut().zip(iid.iter()) {
                 *sum += value;
             }
-            for (sum, &value) in itd_sums.iter_mut().zip(itd.iter()) {
-                *sum += value;
+            if rest.len() >= num_ch {
+                let (itd, _) = rest.split_at(num_ch);
+                for (sum, &value) in itd_sums.iter_mut().zip(itd.iter()) {
+                    *sum += value;
+                }
             }
         }
     }
@@ -1929,6 +1975,14 @@ mod tests {
         let decoded = AnalysisHeader::decode(&binaural.encode()).unwrap();
         assert_eq!(decoded, binaural);
         assert_eq!(decoded.values_per_sample(), 4 * 3);
+
+        let iid_only = AnalysisHeader {
+            mode: MODE_BINAURAL_IID,
+            ..binaural.clone()
+        };
+        let decoded = AnalysisHeader::decode(&iid_only.encode()).unwrap();
+        assert_eq!(decoded, iid_only);
+        assert_eq!(decoded.values_per_sample(), 2 * 3);
 
         let salience = AnalysisHeader {
             value_kind: VALUE_SALIENCE,
@@ -1975,6 +2029,18 @@ mod tests {
         assert!(AnalysisHeader::decode(&bytes).is_err());
         let mut bytes = mono.encode();
         bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(AnalysisHeader::decode(&bytes).is_err());
+        // So is an IID-only binaural header with an empty EI population.
+        let iid_only = AnalysisHeader {
+            mode: MODE_BINAURAL_IID,
+            tau_seconds: vec![-1e-3, 0.0, 1e-3],
+            iid_db: vec![-5.0, 0.0, 5.0],
+            ..mono.clone()
+        };
+        AnalysisHeader::decode(&iid_only.encode()).unwrap();
+        let mut bytes = iid_only.encode();
+        bytes[60..64].copy_from_slice(&0_u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(&0_u32.to_le_bytes());
         assert!(AnalysisHeader::decode(&bytes).is_err());
         // An unknown value kind is rejected.
         let mut bytes = mono.encode();
@@ -2722,6 +2788,100 @@ mod tests {
                 .chunks_exact(4 * 16)
                 .any(|row| row[..16].iter().any(|&v| v > 0.0))
         );
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// The IID-only binaural mode runs the identical deterministic Breebaart
+    /// hybrid as the standard binaural mode but stores only the values and
+    /// characteristic-IID blocks: the shared blocks are bit-identical to the
+    /// standard analysis and the row width halves.
+    #[test]
+    fn binaural_iid_only_matches_full_analysis() {
+        let (wav, gca) = temp_paths("bin_iid_only");
+        write_binaural_noise_wav(&wav, 44_100, 3.0);
+
+        let cancel = AtomicBool::new(false);
+        let full = run_analysis(&wav, &gca, &binaural_test_params(), |_| {}, &cancel).unwrap();
+
+        let iid_gca = gca.with_file_name("tone_iid_only.gca");
+        let params = BuilderParams {
+            mode: AnalysisMode::BinauralIid,
+            ..binaural_test_params()
+        };
+        let header = run_analysis(&wav, &iid_gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, full.num_samples);
+        assert_eq!(header.mode, MODE_BINAURAL_IID);
+        assert_eq!(header.tau_seconds, full.tau_seconds);
+        assert_eq!(header.iid_db, full.iid_db);
+        assert_eq!(header.values_per_sample(), 2 * 32);
+
+        let reader = AnalysisReader::open(&iid_gca).unwrap();
+        assert!(reader.is_binaural());
+        assert!(reader.is_iid_only());
+        assert_eq!(reader.header, header);
+        assert_eq!(reader.data().len(), header.num_samples as usize * 2 * 32);
+
+        let full_reader = AnalysisReader::open(&gca).unwrap();
+        for sample in [0, header.num_samples / 2, header.num_samples - 1] {
+            assert_eq!(reader.dcgc_row(sample), full_reader.dcgc_row(sample));
+            assert_eq!(reader.iid_row(sample), full_reader.iid_row(sample));
+        }
+
+        // Aggregation tolerates the missing ITD block: dcGC and IID sums
+        // match the standard analysis and the ITD sums stay zero.
+        let num_ch = 32_usize;
+        let mut dcgc_sums = vec![0.0_f32; num_ch];
+        let mut iid_sums = vec![0.0_f32; num_ch];
+        let mut itd_sums = vec![0.0_f32; num_ch];
+        reader.aggregate_binaural_column(
+            0,
+            header.num_samples,
+            &mut dcgc_sums,
+            &mut iid_sums,
+            &mut itd_sums,
+        );
+        let mut full_dcgc = vec![0.0_f32; num_ch];
+        let mut full_iid = vec![0.0_f32; num_ch];
+        let mut full_itd = vec![0.0_f32; num_ch];
+        full_reader.aggregate_binaural_column(
+            0,
+            full.num_samples,
+            &mut full_dcgc,
+            &mut full_iid,
+            &mut full_itd,
+        );
+        assert_eq!(dcgc_sums, full_dcgc);
+        assert_eq!(iid_sums, full_iid);
+        assert!(itd_sums.iter().all(|&sum| sum == 0.0));
+
+        let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    /// IID-only mode also applies to the reassigned value kind: per-ear
+    /// reassignment chains run alongside the hybrid and only the IID block
+    /// follows the per-ear mean.
+    #[test]
+    fn binaural_iid_only_reassigned_end_to_end() {
+        let (wav, gca) = temp_paths("bin_iid_only_reassign");
+        let expected_samples = write_binaural_wav(&wav, 0, 1.0);
+
+        let params = BuilderParams {
+            mode: AnalysisMode::BinauralIid,
+            values: AnalysisValues::Reassigned,
+            ..binaural_test_params()
+        };
+        let cancel = AtomicBool::new(false);
+        let header = run_analysis(&wav, &gca, &params, |_| {}, &cancel).unwrap();
+        assert_eq!(header.num_samples, expected_samples);
+        assert_eq!(header.mode, MODE_BINAURAL_IID);
+        assert_eq!(header.value_kind, VALUE_REASSIGNED);
+        assert_eq!(header.values_per_sample(), 2 * 32);
+
+        let reader = AnalysisReader::open(&gca).unwrap();
+        assert_eq!(reader.header, header);
+        assert!(reader.is_iid_only());
+        assert_eq!(reader.data().len(), expected_samples as usize * 2 * 32);
+        assert!(reader.dcgc_row(0).iter().all(|&value| value >= 0.0));
         let _ = fs::remove_dir_all(wav.parent().unwrap());
     }
 

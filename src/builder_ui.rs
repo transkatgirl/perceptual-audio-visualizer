@@ -28,9 +28,13 @@ const CONTROL_MODES: [(&str, ControlMode); 3] = [
 ];
 
 /// Analysis modes offered by the builder (see `AnalysisMode`).
-const ANALYSIS_MODES: [(&str, AnalysisMode); 2] = [
+const ANALYSIS_MODES: [(&str, AnalysisMode); 3] = [
     ("Mono downmix", AnalysisMode::Mono),
     ("Binaural (Breebaart 2001)", AnalysisMode::Binaural),
+    (
+        "Binaural IID only (Breebaart 2001)",
+        AnalysisMode::BinauralIid,
+    ),
 ];
 
 /// Stored-value kinds offered by the builder (see `AnalysisValues`).
@@ -217,7 +221,7 @@ impl BuilderTab {
                 return Some("probe the input file to set the window in milliseconds".into());
             }
         }
-        if self.params.mode == AnalysisMode::Binaural {
+        if self.params.mode.is_binaural() {
             let bin = &self.params.binaural;
             if !(bin.tau_max_seconds.is_finite() && bin.tau_max_seconds > 0.0) {
                 return Some("ITD range must be positive".into());
@@ -254,12 +258,13 @@ impl BuilderTab {
 
     /// f32 values written per input sample: the GCFB channels in mono, the
     /// two-ear dcGC mean plus the lowest-EI-unit IID, ITD, and activity in
-    /// binaural mode.
+    /// binaural mode (only the IID in IID-only binaural mode).
     fn values_per_sample(&self) -> usize {
         let num_ch = self.params.gc.num_ch;
         match self.params.mode {
             AnalysisMode::Mono => num_ch,
             AnalysisMode::Binaural => 4 * num_ch,
+            AnalysisMode::BinauralIid => 2 * num_ch,
         }
     }
 
@@ -568,7 +573,7 @@ impl BuilderTab {
                 });
             });
 
-        if self.params.mode == AnalysisMode::Binaural {
+        if self.params.mode.is_binaural() {
             let bin = &mut self.params.binaural;
 
             egui::CollapsingHeader::new("EI population")
@@ -600,11 +605,16 @@ impl BuilderTab {
                         ui.label("IID units");
                         ui.add(egui::DragValue::new(&mut bin.num_iid).range(1..=21));
                     });
-                    ui.label(
+                    let stored = if self.params.mode == AnalysisMode::BinauralIid {
+                        "characteristic IID is"
+                    } else {
+                        "characteristic IID, ITD, and activity are"
+                    };
+                    ui.label(format!(
                         "Units form a linear ITD × IID grid; per channel and sample only \
-                         the lowest-activity unit's characteristic IID, ITD, and activity \
-                         are stored, so the population size does not affect file size.",
-                    );
+                         the lowest-activity unit's {stored} stored, so the population \
+                         size does not affect file size."
+                    ));
                 });
 
             egui::CollapsingHeader::new("EI stage (Breebaart 2001)")
@@ -845,6 +855,11 @@ impl BuilderTab {
             AnalysisMode::Binaural => {
                 "decoded as stereo and streamed through per-ear filterbanks plus a \
                  Breebaart-2001 EI population"
+            }
+            AnalysisMode::BinauralIid => {
+                "decoded as stereo and streamed through per-ear filterbanks plus a \
+                 Breebaart-2001 EI population whose ITD and activity blocks are dropped \
+                 from the output"
             }
         };
         let values_blurb: String = match &self.params.values {

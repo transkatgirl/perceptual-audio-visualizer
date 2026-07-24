@@ -13,6 +13,10 @@ An [egui](https://github.com/emilk/egui) front-end for
     adaptation loops, and an excitation-inhibition (EI) population tuned to a
     configurable range of characteristic ITDs (default 9 units over ±1 ms).
     The mean of the per-ear dcGC outputs and the EI activity are stored.
+  - **Binaural IID only (Breebaart 2001)** — the same hybrid, but only the
+    characteristic IID of the lowest-activity EI unit is written to disk
+    (the ITD and EI activity blocks are dropped), halving the per-sample row
+    of the full binaural analysis.
 
   Every `GcParam` item is customizable in collapsible sections: gammachirp
   filter coefficients, gain/level references, level estimation, outer/middle-ear
@@ -36,6 +40,7 @@ An [egui](https://github.com/emilk/egui) front-end for
   **IID** (per-ear level difference, with an adjustable ±dB range) and
   **ITD** (the characteristic delay of the best-cancelling EI unit — the EI
   stage computes (L − R)², so the stimulus ITD appears as a trough).
+  IID-only files always use IID hue.
 
 ## Run
 
@@ -51,8 +56,8 @@ the sibling `.gca` is picked up automatically — press *Load*, and hit *Play*.
 The max frequency must be below half the audio file's sample rate, so the
 default 16 kHz ceiling requires a ≥ 32.1 kHz file. Binaural mode requires a
 stereo file. Dynamic control is several × slower than realtime; Static and
-Level are cheaper. Binaural files are 4× larger than mono ones, regardless of
-the EI population size.
+Level are cheaper. Binaural files are 4× larger than mono ones (IID-only
+binaural files 2×), regardless of the EI population size.
 
 ## `.gca` format
 
@@ -70,6 +75,9 @@ analysis as sample-major `f32` rows:
   activity of the lowest-activity EI unit of the ITD × IID population — the
   unit that best cancels the stimulus, as in the `breebaart2001_hybrid`
   example of the gammachirp crate.
+- **binaural IID-only**: per sample `[mean dcGC | IID]`, i.e.
+  `num_samples × 2 × num_channels` values — the same binaural analysis with
+  only the characteristic-IID block stored.
 
 A time window is therefore one contiguous byte range in either mode, which is
 what makes cheap memory-mapped viewing possible.
