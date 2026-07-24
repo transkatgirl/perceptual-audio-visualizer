@@ -2231,6 +2231,7 @@ mod tests {
                 ctrl: ControlMode::Dynamic,
                 ..BuilderParams::default().gc
             },
+            mode: AnalysisMode::Mono,
             ..BuilderParams::default()
         };
         let cancel = AtomicBool::new(false);
@@ -2306,6 +2307,7 @@ mod tests {
                 f_range: [40.0, 16_000.0],
                 ..BuilderParams::default().gc
             },
+            mode: AnalysisMode::Mono,
             ..BuilderParams::default()
         }
     }
@@ -2408,6 +2410,7 @@ mod tests {
                 hloss_compression_health: Some(0.7),
                 ..BuilderParams::default().gc
             },
+            mode: AnalysisMode::Mono,
             ..BuilderParams::default()
         };
         let cancel = AtomicBool::new(false);
@@ -2606,6 +2609,7 @@ mod tests {
                 f_range: [40.0, 16_000.0],
                 ..BuilderParams::default().gc
             },
+            mode: AnalysisMode::Mono,
             values: AnalysisValues::Reassigned,
             ..BuilderParams::default()
         };
@@ -2668,6 +2672,7 @@ mod tests {
                 gain_ref: GainReference::Db(50.0),
                 ..BuilderParams::default().gc
             },
+            mode: AnalysisMode::Mono,
             values: AnalysisValues::Consensus(BandwidthConsensusStreamConfig::default()),
             ..BuilderParams::default()
         };
